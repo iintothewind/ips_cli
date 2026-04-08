@@ -53,6 +53,7 @@ pub struct Config {
     pub threads: Option<usize>,
     pub verbose: bool,
     pub no_color: bool,
+    pub path_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

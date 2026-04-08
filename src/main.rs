@@ -63,6 +63,10 @@ struct Args {
     /// Disable ANSI color output (also respects NO_COLOR env var)
     #[arg(long)]
     no_color: bool,
+
+    /// Path only: print file paths without prompt text (console mode)
+    #[arg(short = 'p', long)]
+    path_only: bool,
 }
 
 fn main() {
@@ -104,6 +108,7 @@ fn main() {
         threads: args.threads,
         verbose: args.verbose,
         no_color,
+        path_only: args.path_only,
     };
 
     // Configure rayon thread pool if a specific count was requested.

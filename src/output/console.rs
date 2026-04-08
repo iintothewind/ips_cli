@@ -17,6 +17,12 @@ pub fn output(results: &[MatchResult], config: &Config) {
 }
 
 fn print_result(stdout: &mut StandardStream, result: &MatchResult, config: &Config) {
+    if config.path_only {
+        stdout.reset().ok();
+        writeln!(stdout, "{}", result.record.path.display()).ok();
+        return;
+    }
+
     // File path — bold cyan, same highlight colour used for matched text
     stdout
         .set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Cyan)))

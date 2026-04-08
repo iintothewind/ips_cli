@@ -6,7 +6,8 @@
       "Bash(powershell -Command \"Set-Location 'C:\\\\Users\\\\user02\\\\code\\\\image_prompt_search'; & '.\\\\target\\\\debug\\\\ips.exe' -q '.' -v -f json .\\\\tests\\\\examples 2>&1 | Out-String\")",
       "Bash(powershell -Command ':*)",
       "Bash(Out-String)",
-      "Bash(powershell -Command \"Set-Location 'C:\\\\Users\\\\user02\\\\code\\\\image_prompt_search'; & 'C:\\\\Users\\\\user02\\\\.cargo\\\\bin\\\\cargo.exe' build 2>&1 | Select-String 'error|Finished'\")"
+      "Bash(powershell -Command \"Set-Location 'C:\\\\Users\\\\user02\\\\code\\\\image_prompt_search'; & 'C:\\\\Users\\\\user02\\\\.cargo\\\\bin\\\\cargo.exe' build 2>&1 | Select-String 'error|Finished'\")",
+      "Bash(cargo build:*)"
     ]
   }
 }
