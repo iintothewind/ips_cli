@@ -2,6 +2,8 @@
 
 A fast CLI tool to search AI-generated image prompts embedded in local image metadata. Supports PNG, JPEG, and WebP files from Stable Diffusion (A1111/Forge), ComfyUI, NovelAI, and InvokeAI.
 
+Extracts searchable prompt text plus structured fields (model, LoRAs, positive/negative prompts) when available.
+
 ## Installation
 
 ```bash
@@ -32,7 +34,9 @@ ips [OPTIONS] --query <QUERY> [PATH]
 | `--fuzzy` | Fuzzy matching instead of exact substring |
 | `--regex` | Regex matching |
 | `--min-score <N>` | Minimum fuzzy match score (default: `50`) |
-| `--full` | Show full prompt without truncation |
+| `--structured` | Show model, LoRAs, and positive/negative prompts in console mode |
+| `--full` | Do not truncate long prompts; also enables structured console output |
+| `-p, --path-only` | Print only matching file paths (no prompt text) |
 | `--depth <N>` | Max directory recursion depth |
 | `--no-recursive` | Only search the top-level directory |
 | `-j, --threads <N>` | Number of worker threads |
@@ -48,7 +52,13 @@ ips -q "cyberpunk"
 # Fuzzy search in a specific directory
 ips -q "sunset landscape" --fuzzy ./ai_art
 
-# Export matches to JSON
+# Structured console output (model, loras, prompts)
+ips -q "masterpiece" --structured ./images
+
+# List matching files only
+ips -q "1girl" -p ./outputs
+
+# Export matches to JSON (includes structured fields when present)
 ips -q "masterpiece" -f json ./images > results.json
 
 # Export to CSV with full prompts
@@ -65,13 +75,18 @@ ips -q "portrait" --no-recursive -v ./downloads
 
 | Generator | Format | How prompts are stored |
 |---|---|---|
-| Stable Diffusion A1111 / Forge | PNG | `tEXt` chunk, keyword `parameters` |
-| ComfyUI | PNG | `tEXt` chunk, keyword `prompt` (workflow JSON) |
-| NovelAI | PNG | `tEXt` chunk, keyword `Comment` (JSON with `"prompt"` field) |
-| NovelAI (alternate) | PNG | `tEXt` chunk, keyword `Description` |
+| Stable Diffusion A1111 / Forge | PNG | `tEXt`/`iTXt` chunk, keyword `parameters` |
+| ComfyUI | PNG | `tEXt`/`iTXt` chunk, keyword `prompt` (workflow JSON) |
+| NovelAI | PNG | `tEXt`/`iTXt` chunk, keyword `Comment` (JSON with `"prompt"` field) |
+| NovelAI (alternate) | PNG | `tEXt`/`iTXt` chunk, keyword `Description` |
 | A1111 / others | JPEG | `COM` marker |
 | Various | JPEG / WebP | XMP `dc:description` field |
+| Legacy / rare | JPEG / WebP | EXIF `UserComment` |
 | InvokeAI | JPEG / WebP | XMP with `invokeai:` namespace |
+
+A single PNG may contain both A1111 `parameters` and ComfyUI `prompt` chunks — ips emits one record per metadata source, so the same file can appear twice in results.
+
+For detailed extraction rules, JSON fallback behavior, and fault-tolerance, see [`ips_design_doc.md`](ips_design_doc.md).
 
 ## Output Formats
 
@@ -81,8 +96,28 @@ Highlights matched text in context with the file path and detected generator:
 
 ```
 ./assets/cyberpunk_city.png [a1111]
-   ...a detailed photo of a cyberpunk city at night, neon lights...
+   ...a detailed photo of a [cyberpunk] city at night, neon lights...
 ```
+
+Long prompts are truncated to a ±80 character window around the match unless `--full` is set.
+
+### Structured console (`--structured` or `--full`)
+
+Prints parsed metadata fields instead of the context window:
+
+```
+./assets/image.png
+
+Generator: comfyui
+Model: PlantMilkModelSuite_almond
+LoRA: lora:style:0.7, lora:detail:0.5
+Positive Prompt:
+a beautiful sunset over mountains
+Negative Prompt:
+blurry, low quality
+```
+
+Use `-p` / `--path-only` to print only paths (works in structured mode too).
 
 ### JSON (`-f json`)
 
@@ -92,12 +127,18 @@ Highlights matched text in context with the file path and detected generator:
     "path": "./assets/cyberpunk_city.png",
     "generator": "a1111",
     "prompt": "a detailed photo of a cyberpunk city at night, neon lights...",
+    "model": "realisticVision.safetensors",
+    "loras": [{"name": "style", "weight": "0.7"}],
+    "positive_prompt": "a detailed photo of a cyberpunk city...",
+    "negative_prompt": "blurry, low quality",
     "score": 120
   }
 ]
 ```
 
-`score` is only present in fuzzy mode.
+- `prompt` is always the full searchable text from metadata.
+- `model`, `loras`, `positive_prompt`, and `negative_prompt` are omitted when empty.
+- `score` is only present in fuzzy mode.
 
 ### CSV (`-f csv`)
 
@@ -105,6 +146,8 @@ Highlights matched text in context with the file path and detected generator:
 path,generator,prompt,score
 ./assets/cyberpunk_city.png,a1111,"a detailed photo of a cyberpunk city...",
 ```
+
+Structured fields are not included in CSV output (use JSON for that).
 
 ## Performance
 
@@ -115,9 +158,9 @@ path,generator,prompt,score
 ## Development
 
 ```bash
-cargo test       # run all tests
-cargo build      # debug build
-cargo build --release  # optimized release build
+cargo test              # run unit tests
+cargo build             # debug build
+cargo build --release   # optimized release build
 ```
 
-Test fixtures for each generator can be placed in `tests/fixtures/`.
+Test image fixtures can be placed in `tests/examples/` for integration tests.

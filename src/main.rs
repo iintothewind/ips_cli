@@ -1,13 +1,8 @@
-mod discovery;
-mod extract;
-mod matcher;
-mod output;
-mod types;
-
 use clap::Parser;
+use ips::types::{Config, MatchMode, OutputFormat};
+use ips::{discovery, extract, matcher, output};
 use rayon::prelude::*;
 use std::path::PathBuf;
-use types::{Config, MatchMode, OutputFormat};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,7 +35,11 @@ struct Args {
     #[arg(long, default_value = "50")]
     min_score: i64,
 
-    /// Show full prompt text in console mode (no truncation)
+    /// Show structured fields (model, loras, positive/negative prompts) in console mode
+    #[arg(long)]
+    structured: bool,
+
+    /// Do not truncate long prompt text in console output
     #[arg(long)]
     full: bool,
 
@@ -75,7 +74,11 @@ fn main() {
     let format = match args.format.as_str() {
         "json" => OutputFormat::Json,
         "csv" => OutputFormat::Csv,
-        _ => OutputFormat::Console,
+        "console" => OutputFormat::Console,
+        other => {
+            eprintln!("ips: unknown output format {:?}; expected console, json, or csv", other);
+            std::process::exit(1);
+        }
     };
 
     let match_mode = if args.regex {
@@ -86,7 +89,6 @@ fn main() {
         MatchMode::Exact
     };
 
-    // Validate the regex pattern early so we can give a clear error message.
     if match_mode == MatchMode::Regex {
         if let Err(e) = regex::Regex::new(&args.query) {
             eprintln!("ips: invalid regex pattern: {}", e);
@@ -94,6 +96,8 @@ fn main() {
         }
     }
 
+    // --full historically enabled structured output; keep compatible.
+    let structured = args.structured || args.full;
     let no_color = args.no_color || std::env::var("NO_COLOR").is_ok();
 
     let config = Config {
@@ -103,6 +107,7 @@ fn main() {
         match_mode,
         min_score: args.min_score,
         full: args.full,
+        structured,
         depth: args.depth,
         no_recursive: args.no_recursive,
         threads: args.threads,
@@ -111,41 +116,41 @@ fn main() {
         path_only: args.path_only,
     };
 
-    // Configure rayon thread pool if a specific count was requested.
     if let Some(n) = config.threads {
-        rayon::ThreadPoolBuilder::new()
+        if let Err(e) = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .build_global()
-            .ok();
+        {
+            eprintln!("ips: could not set thread count to {}: {}", n, e);
+        }
     }
 
-    // Phase 1: discover image files
     let files = discovery::discover_files(&config);
 
     if config.verbose {
         eprintln!("ips: found {} image file(s) to scan", files.len());
     }
 
-    // Phase 2 & 3: extract prompts and match in parallel
-    // Standard mode: extract, match, and output
     let mut results: Vec<_> = files
         .par_iter()
         .flat_map(|path| {
-            let records = extract::extract_prompt(path, config.verbose);
-            records
+            extract::extract_prompt(path, config.verbose)
                 .into_iter()
                 .filter_map(|record| matcher::match_record(&record, &config))
                 .collect::<Vec<_>>()
         })
         .collect();
 
-    // Sort results by file path for deterministic output
-    results.sort_by(|a, b| a.record.path.cmp(&b.record.path));
+    results.sort_by(|a, b| {
+        a.record
+            .path
+            .cmp(&b.record.path)
+            .then(a.record.metadata_key.cmp(&b.record.metadata_key))
+    });
 
     if results.is_empty() && config.format == OutputFormat::Console {
         eprintln!("No matches found.");
     }
 
-    // Phase 4: output
     output::output_results(&results, &config);
 }

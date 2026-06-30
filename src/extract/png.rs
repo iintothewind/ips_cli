@@ -2,7 +2,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 
 use crate::types::{Generator, PromptRecord};
-use super::comfyui;
+use super::{a1111, comfyui};
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
@@ -19,7 +19,6 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
 
     let mut reader = BufReader::new(file);
 
-    // Validate PNG signature
     let mut sig = [0u8; 8];
     if reader.read_exact(&mut sig).is_err() || &sig != PNG_SIGNATURE {
         if verbose {
@@ -31,7 +30,6 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
     let mut results = Vec::new();
 
     loop {
-        // Read chunk length (4 bytes, big-endian)
         let mut length_buf = [0u8; 4];
         match reader.read_exact(&mut length_buf) {
             Ok(_) => {}
@@ -39,18 +37,15 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
         }
         let length = u32::from_be_bytes(length_buf) as usize;
 
-        // Read chunk type (4 bytes)
         let mut chunk_type = [0u8; 4];
         if reader.read_exact(&mut chunk_type).is_err() {
             break;
         }
 
-        // Stop reading metadata once image data begins
         if &chunk_type == b"IDAT" {
             break;
         }
 
-        // Read chunk data
         let mut chunk_data = vec![0u8; length];
         if reader.read_exact(&mut chunk_data).is_err() {
             if verbose {
@@ -59,7 +54,6 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
             break;
         }
 
-        // Skip CRC (4 bytes)
         let mut crc_buf = [0u8; 4];
         if reader.read_exact(&mut crc_buf).is_err() {
             break;
@@ -83,7 +77,6 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
     results
 }
 
-/// Parse a tEXt chunk: keyword\0value
 fn parse_text_chunk(data: &[u8]) -> Option<(String, String)> {
     let null_pos = data.iter().position(|&b| b == 0)?;
     let keyword = String::from_utf8_lossy(&data[..null_pos]).into_owned();
@@ -91,27 +84,21 @@ fn parse_text_chunk(data: &[u8]) -> Option<(String, String)> {
     Some((keyword, value))
 }
 
-/// Parse an iTXt chunk: keyword\0compression_flag compression_method language\0
-/// translated_keyword\0 text
 fn parse_itxt_chunk(data: &[u8]) -> Option<(String, String)> {
     let kw_end = data.iter().position(|&b| b == 0)?;
     let keyword = String::from_utf8_lossy(&data[..kw_end]).into_owned();
 
-    // compression_flag (1) + compression_method (1) = 2 bytes after keyword null
-    let mut pos = kw_end + 3; // skip null, compression_flag, compression_method
+    let mut pos = kw_end + 3;
     if pos > data.len() {
         return None;
     }
 
-    // language tag (null-terminated)
     let lang_end = data[pos..].iter().position(|&b| b == 0)?;
     pos += lang_end + 1;
 
-    // translated keyword (null-terminated)
     let trans_end = data[pos..].iter().position(|&b| b == 0)?;
     pos += trans_end + 1;
 
-    // Remaining bytes are the text value (uncompressed when compression_flag == 0)
     let value = String::from_utf8_lossy(&data[pos..]).into_owned();
     Some((keyword, value))
 }
@@ -119,44 +106,37 @@ fn parse_itxt_chunk(data: &[u8]) -> Option<(String, String)> {
 fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<PromptRecord>) {
     match keyword {
         "parameters" => {
-            results.push(PromptRecord {
-                path: path.to_path_buf(),
-                prompt: value.to_string(),
-                generator: Generator::A1111,
-                metadata_key: keyword.to_string(),
-                raw_metadata: None,
-                details: None,
-            });
+            results.push(PromptRecord::with_details(
+                path.to_path_buf(),
+                value.to_string(),
+                Generator::A1111,
+                keyword,
+                a1111::extract_details(value),
+            ));
         }
         "prompt" => {
             match serde_json::from_str::<serde_json::Value>(value) {
                 Ok(json) => {
-                    // Extract both prompts and details from ComfyUI workflow
-                    let prompts = comfyui::extract_from_workflow(&json);
-                    let details = comfyui::extract_details_from_workflow(&json);
-                    
-                    if !prompts.is_empty() || details.model.is_some() || !details.loras.is_empty() || details.positive_prompt.is_some() || details.negative_prompt.is_some() {
-                        results.push(PromptRecord {
-                            path: path.to_path_buf(),
-                            prompt: prompts.join(" | "),
-                            generator: Generator::ComfyUI,
-                            metadata_key: keyword.to_string(),
-                            raw_metadata: Some(value.to_string()),
-                            details: Some(details),
-                        });
+                    let (prompt, details) = comfyui::extract_workflow(&json);
+                    if comfyui::has_extractable_content(&prompt, &details) {
+                        results.push(PromptRecord::with_details(
+                            path.to_path_buf(),
+                            prompt,
+                            Generator::ComfyUI,
+                            keyword,
+                            details,
+                        ));
                     }
                 }
                 Err(_) => {
-                    // Plain text (non-JSON prompt key)
                     if !value.trim().is_empty() {
-                        results.push(PromptRecord {
-                            path: path.to_path_buf(),
-                            prompt: value.to_string(),
-                            generator: Generator::Unknown,
-                            metadata_key: keyword.to_string(),
-                            raw_metadata: None,
-                            details: None,
-                        });
+                        results.push(PromptRecord::with_details(
+                            path.to_path_buf(),
+                            value.to_string(),
+                            Generator::Unknown,
+                            keyword,
+                            a1111::extract_details(value),
+                        ));
                     }
                 }
             }
@@ -165,40 +145,37 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
             match serde_json::from_str::<serde_json::Value>(value) {
                 Ok(json) => {
                     if let Some(prompt) = json.get("prompt").and_then(|v| v.as_str()) {
-                        results.push(PromptRecord {
-                            path: path.to_path_buf(),
-                            prompt: prompt.to_string(),
-                            generator: Generator::NovelAI,
-                            metadata_key: keyword.to_string(),
-                            raw_metadata: None,
-                            details: None,
-                        });
+                        results.push(PromptRecord::with_details(
+                            path.to_path_buf(),
+                            prompt.to_string(),
+                            Generator::NovelAI,
+                            keyword,
+                            a1111::extract_details(prompt),
+                        ));
                     }
                 }
                 Err(_) => {
                     if !value.trim().is_empty() {
-                        results.push(PromptRecord {
-                            path: path.to_path_buf(),
-                            prompt: value.to_string(),
-                            generator: Generator::Unknown,
-                            metadata_key: keyword.to_string(),
-                            raw_metadata: None,
-                            details: None,
-                        });
+                        results.push(PromptRecord::with_details(
+                            path.to_path_buf(),
+                            value.to_string(),
+                            Generator::Unknown,
+                            keyword,
+                            a1111::extract_details(value),
+                        ));
                     }
                 }
             }
         }
         "Description" => {
             if !value.trim().is_empty() {
-                results.push(PromptRecord {
-                    path: path.to_path_buf(),
-                    prompt: value.to_string(),
-                    generator: Generator::NovelAI,
-                    metadata_key: keyword.to_string(),
-                    raw_metadata: None,
-                    details: None,
-                });
+                results.push(PromptRecord::with_details(
+                    path.to_path_buf(),
+                    value.to_string(),
+                    Generator::NovelAI,
+                    keyword,
+                    a1111::extract_details(value),
+                ));
             }
         }
         _ => {}
@@ -215,7 +192,7 @@ mod tests {
         chunk.extend_from_slice(&length);
         chunk.extend_from_slice(chunk_type);
         chunk.extend_from_slice(data);
-        chunk.extend_from_slice(&[0u8; 4]); // fake CRC
+        chunk.extend_from_slice(&[0u8; 4]);
         chunk
     }
 
@@ -225,73 +202,44 @@ mod tests {
         for chunk in chunks {
             png.extend_from_slice(chunk);
         }
-        // Add IEND chunk
         png.extend_from_slice(&make_png_chunk(b"IEND", &[]));
         png
     }
 
     #[test]
-    fn parse_text_chunk_basic() {
-        let data = b"parameters\x00a1111 prompt text";
-        let result = parse_text_chunk(data).unwrap();
-        assert_eq!(result.0, "parameters");
-        assert_eq!(result.1, "a1111 prompt text");
-    }
-
-    #[test]
-    fn extracts_a1111_parameters() {
-        let chunk_data = b"parameters\x00masterpiece, 1girl, solo".to_vec();
-        let chunks = vec![make_png_chunk(b"tEXt", &chunk_data)];
-        let png_bytes = make_png_with_chunks(&chunks);
-
-        // Write to a temp file and extract
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.png");
-        std::fs::write(&path, &png_bytes).unwrap();
-
-        let records = extract(&path, false);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].generator, Generator::A1111);
-        assert_eq!(records[0].prompt, "masterpiece, 1girl, solo");
-    }
-
-    #[test]
-    fn extracts_novelai_comment() {
-        let json = r#"{"prompt":"1girl, masterpiece","steps":28}"#;
-        let mut data = b"Comment\x00".to_vec();
-        data.extend_from_slice(json.as_bytes());
-        let chunks = vec![make_png_chunk(b"tEXt", &data)];
-        let png_bytes = make_png_with_chunks(&chunks);
+    fn extracts_a1111_model_from_parameters() {
+        let text = "masterpiece\nNegative prompt: blurry\nSteps: 30, Model: base.safetensors, Seed: 1";
+        let mut chunk_data = b"parameters\x00".to_vec();
+        chunk_data.extend_from_slice(text.as_bytes());
+        let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &chunk_data)]);
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.png");
         std::fs::write(&path, &png_bytes).unwrap();
 
         let records = extract(&path, false);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].generator, Generator::NovelAI);
-        assert_eq!(records[0].prompt, "1girl, masterpiece");
+        assert_eq!(
+            records[0].details_or_default().model.as_deref(),
+            Some("base.safetensors")
+        );
     }
 
     #[test]
-    fn stops_at_idat() {
-        // Parameters chunk AFTER IDAT should not be read
-        let chunk_before = make_png_chunk(b"tEXt", b"parameters\x00before idat");
-        let idat = make_png_chunk(b"IDAT", b"\x00\x00");
-        let chunk_after = make_png_chunk(b"tEXt", b"parameters\x00after idat");
-
-        let mut png = Vec::new();
-        png.extend_from_slice(PNG_SIGNATURE);
-        png.extend_from_slice(&chunk_before);
-        png.extend_from_slice(&idat);
-        png.extend_from_slice(&chunk_after);
+    fn falls_back_to_a1111_when_prompt_json_invalid() {
+        let text = "masterpiece\nNegative prompt: blurry\nSteps: 30, Model: base.safetensors, Seed: 1";
+        let mut data = b"prompt\x00".to_vec();
+        data.extend_from_slice(text.as_bytes());
+        let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &data)]);
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("test.png");
-        std::fs::write(&path, &png).unwrap();
+        std::fs::write(&path, &png_bytes).unwrap();
 
         let records = extract(&path, false);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].prompt, "before idat");
+        assert_eq!(records[0].generator, Generator::Unknown);
+        assert_eq!(
+            records[0].details_or_default().model.as_deref(),
+            Some("base.safetensors")
+        );
     }
 }

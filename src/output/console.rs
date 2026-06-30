@@ -76,6 +76,12 @@ fn print_result(stdout: &mut StandardStream, result: &MatchResult, config: &Conf
 
 /// Print structured prompt record with parsed components.
 fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromptRecord, config: &Config) {
+    if config.path_only {
+        stdout.reset().ok();
+        writeln!(stdout, "{}", record.path.display()).ok();
+        return;
+    }
+
     // File path — bold cyan
     stdout
         .set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Cyan)))
@@ -102,9 +108,9 @@ fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromp
         stdout.reset().ok();
     }
 
-    // LoRA field — bold yellow, format as <lora:name:weight>
+    // LoRA field — bold yellow
     if !record.loras.is_empty() {
-        let lora_str = record.loras.iter().map(|l| format!("<lora:{}:{}>", l.name, l.weight)).collect::<Vec<_>>().join(", ");
+        let lora_str = record.loras.iter().map(|l| format!("lora:{}:{}", l.name, l.weight)).collect::<Vec<_>>().join(", ");
         stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
         writeln!(stdout, "LoRA: {}", lora_str).ok();
         stdout.reset().ok();
@@ -121,12 +127,7 @@ fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromp
         stdout.reset().ok();
         // Print each line of positive prompt on a new line
         for line in pos.lines() {
-            let truncated = if line.len() > 500 && !config.full {
-                format!("...{}...", &line[..250])
-            } else {
-                line.to_string()
-            };
-            writeln!(stdout, "{}", truncated).ok();
+            writeln!(stdout, "{}", truncate_line(line, config.full)).ok();
         }
     } else {
         stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
@@ -141,12 +142,7 @@ fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromp
         stdout.reset().ok();
         // Print each line of negative prompt on a new line
         for line in neg.lines() {
-            let truncated = if line.len() > 500 && !config.full {
-                format!("...{}...", &line[..250])
-            } else {
-                line.to_string()
-            };
-            writeln!(stdout, "{}", truncated).ok();
+            writeln!(stdout, "{}", truncate_line(line, config.full)).ok();
         }
     } else {
         stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
@@ -155,6 +151,18 @@ fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromp
     }
 
     writeln!(stdout).ok(); // blank line between results
+}
+
+fn truncate_line(line: &str, full: bool) -> String {
+    const MAX_LINE: usize = 500;
+    const HEAD: usize = 250;
+
+    if full || line.len() <= MAX_LINE {
+        return line.to_string();
+    }
+
+    let end = floor_char_boundary(line, HEAD);
+    format!("...{}...", &line[..end])
 }
 
 /// Returns (window_text, adjusted_ranges, prefix_ellipsis, suffix_ellipsis)

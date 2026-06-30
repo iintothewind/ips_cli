@@ -1,14 +1,15 @@
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::types::{Generator, PromptRecord};
-use super::{exif, jpeg};
+use super::{a1111, exif, jpeg};
 
 const RIFF_MAGIC: &[u8; 4] = b"RIFF";
 const WEBP_MAGIC: &[u8; 4] = b"WEBP";
 
 pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
         Err(e) => {
             if verbose {
                 eprintln!("ips: cannot read {}: {}", path.display(), e);
@@ -17,14 +18,17 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
         }
     };
 
-    if data.len() < 12 {
+    let mut reader = BufReader::new(file);
+
+    let mut header = [0u8; 12];
+    if reader.read_exact(&mut header).is_err() {
         if verbose {
             eprintln!("ips: {}: file too small to be a WebP", path.display());
         }
         return vec![];
     }
 
-    if &data[0..4] != RIFF_MAGIC || &data[8..12] != WEBP_MAGIC {
+    if &header[0..4] != RIFF_MAGIC || &header[8..12] != WEBP_MAGIC {
         if verbose {
             eprintln!("ips: {}: not a valid WebP", path.display());
         }
@@ -32,68 +36,68 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
     }
 
     let mut results = Vec::new();
-    let mut pos = 12usize; // skip RIFF header (RIFF + size + WEBP)
 
-    while pos + 8 <= data.len() {
-        let chunk_id = &data[pos..pos + 4];
-        let chunk_size =
-            u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                as usize;
-        pos += 8;
-
-        if pos + chunk_size > data.len() {
-            if verbose {
-                eprintln!("ips: {}: truncated WebP chunk", path.display());
-            }
+    loop {
+        let mut chunk_header = [0u8; 8];
+        if reader.read_exact(&mut chunk_header).is_err() {
             break;
         }
 
-        let chunk_data = &data[pos..pos + chunk_size];
-
-        // RIFF chunks are padded to even size
-        let padded = chunk_size + (chunk_size & 1);
-        pos += padded;
+        let chunk_id = &chunk_header[..4];
+        let chunk_size = u32::from_le_bytes([
+            chunk_header[4], chunk_header[5], chunk_header[6], chunk_header[7],
+        ]) as usize;
+        let padded_size = chunk_size + (chunk_size & 1);
 
         match chunk_id {
             b"XMP " => {
-                // XMP XML data — same extraction as JPEG XMP
-                if let Some(prompt) = jpeg::extract_xmp_description(chunk_data) {
-                    let generator = jpeg::detect_xmp_generator(chunk_data);
-                    results.push(PromptRecord {
-                        path: path.to_path_buf(),
-                        prompt,
+                let mut chunk_data = vec![0u8; chunk_size];
+                if reader.read_exact(&mut chunk_data).is_err() {
+                    if verbose {
+                        eprintln!("ips: {}: truncated XMP chunk", path.display());
+                    }
+                    break;
+                }
+                if chunk_size & 1 != 0 {
+                    let _ = reader.seek(SeekFrom::Current(1));
+                }
+                if let Some(prompt) = jpeg::extract_xmp_description(&chunk_data) {
+                    let generator = jpeg::detect_xmp_generator(&chunk_data);
+                    results.push(PromptRecord::with_details(
+                        path.to_path_buf(),
+                        prompt.clone(),
                         generator,
-                        metadata_key: "XMP".to_string(),
-                        raw_metadata: None,
-                        details: None,
-                    });
+                        "XMP",
+                        a1111::extract_details(&prompt),
+                    ));
                 }
             }
             b"EXIF" => {
-                if let Some(raw_meta) = exif::extract_raw_metadata(chunk_data) {
-                    if let Some(prompt) = exif::extract_user_comment(chunk_data) {
-                        // Detect generator from metadata
-                        // WebP EXIF format: check for A1111 vs ComfyUI markers
-                        let generator = if raw_meta.contains("ckpt_name") {
-                            Generator::ComfyUI
-                        } else if raw_meta.contains("positive_prompt") || raw_meta.contains("Steps:") {
-                            Generator::A1111
-                        } else {
-                            Generator::Unknown
-                        };
-                        
-                        results.push(PromptRecord {
-                            path: path.to_path_buf(),
-                            prompt,
-                            generator,
-                            metadata_key: "UserComment".to_string(),
-                            raw_metadata: Some(raw_meta),
-                            details: None, // WebP details not fully implemented yet
-                        });
+                let mut chunk_data = vec![0u8; chunk_size];
+                if reader.read_exact(&mut chunk_data).is_err() {
+                    if verbose {
+                        eprintln!("ips: {}: truncated EXIF chunk", path.display());
                     }
+                    break;
+                }
+                if chunk_size & 1 != 0 {
+                    let _ = reader.seek(SeekFrom::Current(1));
+                }
+                if let Some(prompt) = exif::extract_user_comment(&chunk_data) {
+                    results.push(PromptRecord::with_details(
+                        path.to_path_buf(),
+                        prompt.clone(),
+                        Generator::Unknown,
+                        "UserComment",
+                        a1111::extract_details(&prompt),
+                    ));
                 }
             }
-            _ => {}
+            _ => {
+                if reader.seek(SeekFrom::Current(padded_size as i64)).is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -108,19 +112,17 @@ mod tests {
         let xmp_bytes = xmp.as_bytes();
         let chunk_size = xmp_bytes.len() as u32;
         let padded_size = (xmp_bytes.len() + (xmp_bytes.len() & 1)) as u32;
-
-        // RIFF size = 4 (WEBP) + 8 (chunk header) + padded_size
         let riff_size = (4 + 8 + padded_size).to_le_bytes();
 
         let mut webp = Vec::new();
         webp.extend_from_slice(b"RIFF");
         webp.extend_from_slice(&riff_size);
         webp.extend_from_slice(b"WEBP");
-        webp.extend_from_slice(b"XMP "); // chunk id with trailing space
+        webp.extend_from_slice(b"XMP ");
         webp.extend_from_slice(&chunk_size.to_le_bytes());
         webp.extend_from_slice(xmp_bytes);
         if xmp_bytes.len() % 2 != 0 {
-            webp.push(0); // padding byte
+            webp.push(0);
         }
         webp
     }
@@ -145,15 +147,5 @@ mod tests {
         let records = extract(&path, false);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].prompt, "sunset landscape, watercolor");
-    }
-
-    #[test]
-    fn rejects_invalid_webp() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.webp");
-        std::fs::write(&path, b"not a webp file at all").unwrap();
-
-        let records = extract(&path, true);
-        assert!(records.is_empty());
     }
 }

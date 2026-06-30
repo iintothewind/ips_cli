@@ -67,11 +67,13 @@ mod tests {
             match_mode: crate::types::MatchMode::Exact,
             min_score: 50,
             full: false,
+            structured: false,
             depth: None,
             no_recursive: false,
             threads: None,
             verbose: false,
             no_color: true,
+            path_only: false,
         };
         let files = discover_files(&config);
         assert_eq!(files.len(), 3);
@@ -87,11 +89,13 @@ mod tests {
             match_mode: crate::types::MatchMode::Exact,
             min_score: 50,
             full: false,
+            structured: false,
             depth: None,
             no_recursive: true,
             threads: None,
             verbose: false,
             no_color: true,
+            path_only: false,
         };
         let files = discover_files(&config);
         assert_eq!(files.len(), 2); // only a.png and b.jpg

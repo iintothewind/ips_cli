@@ -61,11 +61,13 @@ fn end_to_end_a1111_png_exact() {
         match_mode: types::MatchMode::Exact,
         min_score: 50,
         full: false,
+        structured: false,
         depth: None,
         no_recursive: false,
         threads: None,
         verbose: false,
         no_color: true,
+        path_only: false,
     };
 
     let files = discovery::discover_files(&config);
@@ -94,11 +96,13 @@ fn end_to_end_jpeg_com_no_match() {
         match_mode: types::MatchMode::Exact,
         min_score: 50,
         full: false,
+        structured: false,
         depth: None,
         no_recursive: false,
         threads: None,
         verbose: false,
         no_color: true,
+        path_only: false,
     };
 
     let files = discovery::discover_files(&config);
@@ -147,6 +151,7 @@ fn fuzzy_matching_finds_approximate() {
         prompt: "masterpiece, 1girl, detailed background, cyberpunk".to_string(),
         generator: types::Generator::A1111,
         metadata_key: "parameters".to_string(),
+        details: None,
     };
 
     let config = types::Config {
@@ -156,11 +161,13 @@ fn fuzzy_matching_finds_approximate() {
         match_mode: types::MatchMode::Fuzzy,
         min_score: 10, // low threshold to ensure fuzzy match succeeds
         full: false,
+        structured: false,
         depth: None,
         no_recursive: false,
         threads: None,
         verbose: false,
         no_color: true,
+        path_only: false,
     };
 
     let result = matcher::match_record(&record, &config);
@@ -178,6 +185,7 @@ fn regex_matching() {
         prompt: "1girl, masterpiece, 4k resolution".to_string(),
         generator: types::Generator::A1111,
         metadata_key: "parameters".to_string(),
+        details: None,
     };
 
     let config = types::Config {
@@ -187,11 +195,13 @@ fn regex_matching() {
         match_mode: types::MatchMode::Regex,
         min_score: 50,
         full: false,
+        structured: false,
         depth: None,
         no_recursive: false,
         threads: None,
         verbose: false,
         no_color: true,
+        path_only: false,
     };
 
     let result = matcher::match_record(&record, &config);
@@ -258,11 +268,13 @@ fn real_directory_search_finds_matches() {
         match_mode: types::MatchMode::Exact,
         min_score: 50,
         full: false,
+        structured: false,
         depth: None,
         no_recursive: false,
         threads: None,
         verbose: false,
         no_color: true,
+        path_only: false,
     };
 
     let files = discovery::discover_files(&config);

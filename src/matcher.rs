@@ -1,5 +1,12 @@
+use std::cell::RefCell;
+
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use crate::types::{Config, MatchMode, MatchResult, PromptRecord};
+
+thread_local! {
+    static SKIM: SkimMatcherV2 = SkimMatcherV2::default();
+    static REGEX_CACHE: RefCell<Option<(String, regex::Regex)>> = RefCell::new(None);
+}
 
 pub fn match_record(record: &PromptRecord, config: &Config) -> Option<MatchResult> {
     match config.match_mode {
@@ -10,54 +17,79 @@ pub fn match_record(record: &PromptRecord, config: &Config) -> Option<MatchResul
 }
 
 fn match_exact(record: &PromptRecord, config: &Config) -> Option<MatchResult> {
-    let query_lower = config.query.to_lowercase();
-    let prompt_lower = record.prompt.to_lowercase();
-
-    prompt_lower.find(&query_lower).map(|byte_pos| {
-        let end = byte_pos + query_lower.len();
-        MatchResult {
-            record: record.clone(),
-            score: None,
-            match_ranges: vec![(byte_pos, end)],
-        }
-    })
-}
-
-fn match_fuzzy(record: &PromptRecord, config: &Config) -> Option<MatchResult> {
-    let matcher = SkimMatcherV2::default();
-
-    let (score, char_indices) = matcher.fuzzy_indices(&record.prompt, &config.query)?;
-
-    if score < config.min_score {
+    let query_chars: Vec<char> = config.query.chars().collect();
+    if query_chars.is_empty() {
         return None;
     }
 
-    // Convert character indices to byte ranges
     let prompt_chars: Vec<(usize, char)> = record.prompt.char_indices().collect();
-    let match_ranges: Vec<(usize, usize)> = char_indices
-        .iter()
-        .filter_map(|&ci| {
-            prompt_chars.get(ci).map(|&(byte_start, ch)| {
-                (byte_start, byte_start + ch.len_utf8())
-            })
-        })
-        .collect();
 
-    Some(MatchResult {
-        record: record.clone(),
-        score: Some(score),
-        match_ranges,
+    for window in prompt_chars.windows(query_chars.len()) {
+        let matches = window
+            .iter()
+            .zip(query_chars.iter())
+            .all(|(&(_, prompt_ch), &query_ch)| chars_eq_ignore_case(prompt_ch, query_ch));
+
+        if matches {
+            let start = window[0].0;
+            let (end_byte, last_ch) = window[window.len() - 1];
+            return Some(MatchResult {
+                record: record.clone(),
+                score: None,
+                match_ranges: vec![(start, end_byte + last_ch.len_utf8())],
+            });
+        }
+    }
+
+    None
+}
+
+fn chars_eq_ignore_case(a: char, b: char) -> bool {
+    if a == b {
+        return true;
+    }
+    a.to_lowercase().eq(b.to_lowercase())
+}
+
+fn match_fuzzy(record: &PromptRecord, config: &Config) -> Option<MatchResult> {
+    SKIM.with(|matcher| {
+        let (score, char_indices) = matcher.fuzzy_indices(&record.prompt, &config.query)?;
+
+        if score < config.min_score {
+            return None;
+        }
+
+        let prompt_chars: Vec<(usize, char)> = record.prompt.char_indices().collect();
+        let match_ranges: Vec<(usize, usize)> = char_indices
+            .iter()
+            .filter_map(|&ci| {
+                prompt_chars.get(ci).map(|&(byte_start, ch)| {
+                    (byte_start, byte_start + ch.len_utf8())
+                })
+            })
+            .collect();
+
+        Some(MatchResult {
+            record: record.clone(),
+            score: Some(score),
+            match_ranges,
+        })
     })
 }
 
 fn match_regex(record: &PromptRecord, config: &Config) -> Option<MatchResult> {
-    // The regex was validated at startup; this unwrap is safe.
-    let re = regex::Regex::new(&config.query).ok()?;
-
-    re.find(&record.prompt).map(|m| MatchResult {
-        record: record.clone(),
-        score: None,
-        match_ranges: vec![(m.start(), m.end())],
+    REGEX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        if c.as_ref().map_or(true, |(q, _)| q != &config.query) {
+            let re = regex::Regex::new(&config.query).ok()?;
+            *c = Some((config.query.clone(), re));
+        }
+        let re = &c.as_ref()?.1;
+        re.find(&record.prompt).map(|m| MatchResult {
+            record: record.clone(),
+            score: None,
+            match_ranges: vec![(m.start(), m.end())],
+        })
     })
 }
 
@@ -68,12 +100,13 @@ mod tests {
     use crate::types::{Generator, OutputFormat};
 
     fn make_record(prompt: &str) -> PromptRecord {
-        PromptRecord {
-            path: PathBuf::from("test.png"),
-            prompt: prompt.to_string(),
-            generator: Generator::Unknown,
-            metadata_key: "parameters".to_string(),
-        }
+        PromptRecord::with_details(
+            PathBuf::from("test.png"),
+            prompt.to_string(),
+            Generator::Unknown,
+            "parameters",
+            Default::default(),
+        )
     }
 
     fn config(query: &str, mode: MatchMode) -> Config {
@@ -84,11 +117,13 @@ mod tests {
             match_mode: mode,
             min_score: 50,
             full: false,
+            structured: false,
             depth: None,
             no_recursive: false,
             threads: None,
             verbose: false,
             no_color: true,
+            path_only: false,
         }
     }
 
@@ -106,6 +141,16 @@ mod tests {
         let record = make_record("Masterpiece, 1girl");
         let result = match_exact(&record, &config("masterpiece", MatchMode::Exact));
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn exact_match_unicode() {
+        let record = make_record("杰作 masterpiece 测试");
+        let result = match_exact(&record, &config("杰作", MatchMode::Exact));
+        assert!(result.is_some());
+        let r = result.unwrap();
+        let matched = &record.prompt[r.match_ranges[0].0..r.match_ranges[0].1];
+        assert_eq!(matched, "杰作");
     }
 
     #[test]

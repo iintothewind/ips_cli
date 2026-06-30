@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use serde::{Serialize, Serializer};
+use serde::Serialize;
 
 /// A prompt extracted from a single image file.
 #[derive(Debug, Clone, Serialize)]
@@ -8,22 +8,49 @@ pub struct PromptRecord {
     pub prompt: String,
     pub generator: Generator,
     pub metadata_key: String,
-    /// Raw metadata value (e.g., JSON string for ComfyUI workflows)
-    pub raw_metadata: Option<String>,
     /// Extracted prompt details (model, loras, positive/negative prompts)
     pub details: Option<PromptDetails>,
 }
 
-/// LoRA info from ComfyUI workflow
-#[derive(Debug, Clone, Serialize)]
-pub struct LoraInfo {
-    pub name: String,
-    #[serde(serialize_with = "serialize_weight")]
-    pub weight: f32,
+impl PromptRecord {
+    pub fn with_details(
+        path: PathBuf,
+        prompt: String,
+        generator: Generator,
+        metadata_key: impl Into<String>,
+        details: PromptDetails,
+    ) -> Self {
+        Self {
+            path,
+            prompt,
+            generator,
+            metadata_key: metadata_key.into(),
+            details: Some(details),
+        }
+    }
+
+    pub fn details_or_default(&self) -> PromptDetails {
+        self.details.clone().unwrap_or_default()
+    }
+
+    pub fn to_structured(&self) -> StructuredPromptRecord {
+        let details = self.details_or_default();
+        StructuredPromptRecord {
+            path: self.path.clone(),
+            generator: self.generator.clone(),
+            model: details.model,
+            loras: details.loras,
+            positive: details.positive_prompt,
+            negative: details.negative_prompt,
+        }
+    }
 }
 
-fn serialize_weight<S: Serializer>(weight: &f32, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&format!("{:.2}", weight))
+/// LoRA info from ComfyUI workflow or A1111 prompt tags.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct LoraInfo {
+    pub name: String,
+    pub weight: String,
 }
 
 /// Prompt details extracted from metadata (ComfyUI workflow, A1111 parameters, etc.)
@@ -89,6 +116,7 @@ pub struct Config {
     pub match_mode: MatchMode,
     pub min_score: i64,
     pub full: bool,
+    pub structured: bool,
     pub depth: Option<usize>,
     pub no_recursive: bool,
     pub threads: Option<usize>,

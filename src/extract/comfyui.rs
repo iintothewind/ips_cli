@@ -45,6 +45,31 @@ pub fn extract_from_workflow(json: &Value) -> Vec<String> {
     prompts
 }
 
+/// Extract searchable prompt text and structured details from a ComfyUI workflow.
+pub fn extract_workflow(json: &Value) -> (String, PromptDetails) {
+    let prompts = extract_from_workflow(json);
+    let details = extract_details_from_workflow(json);
+    let prompt = if !prompts.is_empty() {
+        prompts.join(" | ")
+    } else {
+        [details.positive_prompt.as_deref(), details.negative_prompt.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    (prompt, details)
+}
+
+pub fn has_extractable_content(prompt: &str, details: &PromptDetails) -> bool {
+    !prompt.trim().is_empty()
+        || details.model.is_some()
+        || !details.loras.is_empty()
+        || details.positive_prompt.is_some()
+        || details.negative_prompt.is_some()
+}
+
 pub fn extract_details_from_workflow(json: &Value) -> PromptDetails {
     let Some(nodes) = json.as_object() else {
         return PromptDetails::default();
@@ -88,7 +113,7 @@ pub fn extract_details_from_workflow(json: &Value) -> PromptDetails {
     details
 }
 
-pub fn extract_model(json: &Value) -> Option<String> {
+fn extract_model(json: &Value) -> Option<String> {
     let nodes = json.as_object()?;
 
     for field in ["ckpt_name", "unet_name"] {
@@ -182,9 +207,7 @@ fn push_lora(loras: &mut Vec<LoraInfo>, name: String, weight: String) {
     if loras.iter().any(|l| l.name == name) {
         return;
     }
-    if let Ok(w) = weight.parse::<f32>() {
-        loras.push(LoraInfo { name, weight: w });
-    }
+    loras.push(LoraInfo { name, weight });
 }
 
 fn format_lora_weight(model_weight: Option<&str>, clip_weight: Option<&str>) -> Option<String> {

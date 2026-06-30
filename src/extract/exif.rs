@@ -11,23 +11,6 @@ pub fn extract_user_comment(data: &[u8]) -> Option<String> {
     ExifReader::new(tiff)?.user_comment()
 }
 
-/// Extract the raw metadata string from EXIF data.
-///
-/// ComfyUI stores prompt metadata in a JSON-like format within the UserComment field.
-pub fn extract_raw_metadata(tiff: &[u8]) -> Option<String> {
-    let reader = ExifReader::new(tiff)?;
-    
-    // Get the full UserComment text
-    if let Some(comment) = reader.user_comment() {
-        // Check if this looks like structured metadata (contains Model:, LoRA:, etc.)
-        if comment.contains("Model:") || comment.contains("LoRA:") || comment.contains("positive_prompt") {
-            return Some(comment);
-        }
-    }
-    
-    None
-}
-
 struct ExifReader<'a> {
     data: &'a [u8],
     le: bool,
