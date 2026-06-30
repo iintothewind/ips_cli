@@ -1,6 +1,6 @@
 use std::io::Write;
 use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
-use crate::types::{Config, MatchResult};
+use crate::types::{Config, MatchResult, StructuredPromptRecord};
 
 pub fn output(results: &[MatchResult], config: &Config) {
     let color_choice = if config.no_color {
@@ -13,6 +13,20 @@ pub fn output(results: &[MatchResult], config: &Config) {
 
     for result in results {
         print_result(&mut stdout, result, config);
+    }
+}
+
+pub fn output_structured(results: &[StructuredPromptRecord], config: &Config) {
+    let color_choice = if config.no_color {
+        ColorChoice::Never
+    } else {
+        ColorChoice::Auto
+    };
+
+    let mut stdout = StandardStream::stdout(color_choice);
+
+    for record in results {
+        print_structured_result(&mut stdout, record, config);
     }
 }
 
@@ -57,6 +71,89 @@ fn print_result(stdout: &mut StandardStream, result: &MatchResult, config: &Conf
     }
 
     writeln!(stdout).ok();
+    writeln!(stdout).ok(); // blank line between results
+}
+
+/// Print structured prompt record with parsed components.
+fn print_structured_result(stdout: &mut StandardStream, record: &StructuredPromptRecord, config: &Config) {
+    // File path — bold cyan
+    stdout
+        .set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Cyan)))
+        .ok();
+    write!(stdout, "{}", record.path.display()).ok();
+    stdout.reset().ok();
+
+    // Blank line
+    writeln!(stdout).ok();
+
+    // Generator field — bold yellow
+    stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+    writeln!(stdout, "Generator: {}", record.generator).ok();
+    stdout.reset().ok();
+
+    // Model field — bold yellow
+    if let Some(ref model) = record.model {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Model: {}", model).ok();
+        stdout.reset().ok();
+    } else {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Model: —").ok();
+        stdout.reset().ok();
+    }
+
+    // LoRA field — bold yellow, format as <lora:name:weight>
+    if !record.loras.is_empty() {
+        let lora_str = record.loras.iter().map(|l| format!("<lora:{}:{}>", l.name, l.weight)).collect::<Vec<_>>().join(", ");
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "LoRA: {}", lora_str).ok();
+        stdout.reset().ok();
+    } else {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "LoRA: —").ok();
+        stdout.reset().ok();
+    }
+
+    // Positive prompt field — bold yellow, multiline
+    if let Some(ref pos) = record.positive {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Positive Prompt:").ok();
+        stdout.reset().ok();
+        // Print each line of positive prompt on a new line
+        for line in pos.lines() {
+            let truncated = if line.len() > 500 && !config.full {
+                format!("...{}...", &line[..250])
+            } else {
+                line.to_string()
+            };
+            writeln!(stdout, "{}", truncated).ok();
+        }
+    } else {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Positive Prompt: —").ok();
+        stdout.reset().ok();
+    }
+
+    // Negative prompt field — bold yellow, multiline
+    if let Some(ref neg) = record.negative {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Negative Prompt:").ok();
+        stdout.reset().ok();
+        // Print each line of negative prompt on a new line
+        for line in neg.lines() {
+            let truncated = if line.len() > 500 && !config.full {
+                format!("...{}...", &line[..250])
+            } else {
+                line.to_string()
+            };
+            writeln!(stdout, "{}", truncated).ok();
+        }
+    } else {
+        stdout.set_color(ColorSpec::new().set_bold(true).set_fg(Some(Color::Yellow))).ok();
+        writeln!(stdout, "Negative Prompt: —").ok();
+        stdout.reset().ok();
+    }
+
     writeln!(stdout).ok(); // blank line between results
 }
 

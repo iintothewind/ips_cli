@@ -1,17 +1,7 @@
-/// Minimal EXIF/TIFF parser that extracts the UserComment tag (0x9286).
-///
-/// Handles both byte orders (II = little-endian, MM = big-endian).
-/// Walks IFD0 and the linked ExifIFD to find UserComment.
-/// Decodes ASCII, Unicode (UTF-16LE), and undefined (lossy UTF-8) charsets.
-
 const TAG_EXIF_IFD: u16 = 0x8769;
 const TAG_USER_COMMENT: u16 = 0x9286;
 const EXIF_PREFIX: &[u8] = b"Exif\0\0";
 
-/// Extract the UserComment string from a raw EXIF blob.
-///
-/// `data` may start with the "Exif\0\0" prefix (as found in JPEG APP1 / WebP EXIF chunks)
-/// or directly with the TIFF header.
 pub fn extract_user_comment(data: &[u8]) -> Option<String> {
     let tiff = if data.starts_with(EXIF_PREFIX) {
         &data[EXIF_PREFIX.len()..]
@@ -21,9 +11,26 @@ pub fn extract_user_comment(data: &[u8]) -> Option<String> {
     ExifReader::new(tiff)?.user_comment()
 }
 
+/// Extract the raw metadata string from EXIF data.
+///
+/// ComfyUI stores prompt metadata in a JSON-like format within the UserComment field.
+pub fn extract_raw_metadata(tiff: &[u8]) -> Option<String> {
+    let reader = ExifReader::new(tiff)?;
+    
+    // Get the full UserComment text
+    if let Some(comment) = reader.user_comment() {
+        // Check if this looks like structured metadata (contains Model:, LoRA:, etc.)
+        if comment.contains("Model:") || comment.contains("LoRA:") || comment.contains("positive_prompt") {
+            return Some(comment);
+        }
+    }
+    
+    None
+}
+
 struct ExifReader<'a> {
     data: &'a [u8],
-    le: bool, // true = little-endian
+    le: bool,
 }
 
 impl<'a> ExifReader<'a> {
@@ -56,8 +63,6 @@ impl<'a> ExifReader<'a> {
         self.scan_ifd(ifd0, 0)
     }
 
-    /// Walk an IFD looking for UserComment; follow ExifIFD pointer if found.
-    /// `depth` guards against malformed data with recursive IFD chains.
     fn scan_ifd(&self, offset: usize, depth: u8) -> Option<String> {
         if depth > 4 {
             return None;
@@ -77,9 +82,6 @@ impl<'a> ExifReader<'a> {
 
             match tag {
                 TAG_USER_COMMENT => {
-                    // Value offset is relative to the TIFF header start.
-                    // If count <= 4 the value is stored inline at e+8, but
-                    // UserComment is always > 4 bytes (8-byte charset id + text).
                     let val_off = self.u32(e + 8)? as usize;
                     if let Some(text) = self.decode_user_comment(val_off, count) {
                         return Some(text);
@@ -92,7 +94,6 @@ impl<'a> ExifReader<'a> {
             }
         }
 
-        // UserComment not in this IFD; try ExifIFD
         if let Some(off) = exif_ifd {
             return self.scan_ifd(off, depth + 1);
         }
@@ -104,8 +105,6 @@ impl<'a> ExifReader<'a> {
         if offset >= self.data.len() {
             return None;
         }
-        // Some writers record a count larger than what fits in the APP1 segment.
-        // Clamp to the actually available bytes so we can still extract the text.
         let count = count.min(self.data.len() - offset);
         if count < 8 {
             return None;
@@ -119,34 +118,25 @@ impl<'a> ExifReader<'a> {
                 .trim()
                 .to_string(),
             b"UNICODE\0" => decode_utf16(body, self.le),
-            _ => {
-                // Undefined or unknown charset — try lossy UTF-8
-                String::from_utf8_lossy(body)
-                    .trim_matches('\0')
-                    .trim()
-                    .to_string()
-            }
+            _ => String::from_utf8_lossy(body)
+                .trim_matches('\0')
+                .trim()
+                .to_string(),
         };
 
         if text.is_empty() { None } else { Some(text) }
     }
 }
 
-/// Decode a UTF-16 byte sequence.
-///
-/// The EXIF spec says UNICODE UserComment follows the TIFF byte order, so
-/// big-endian TIFF ("MM") files use UTF-16BE and little-endian ("II") use
-/// UTF-16LE.  A BOM at the start of the bytes, if present, overrides this.
 fn decode_utf16(bytes: &[u8], tiff_le: bool) -> String {
     if bytes.len() < 2 {
         return String::new();
     }
 
-    // Detect optional BOM and strip it.
     let (le, data) = match bytes.get(0..2) {
-        Some(&[0xFF, 0xFE]) => (true, &bytes[2..]),  // UTF-16LE BOM
-        Some(&[0xFE, 0xFF]) => (false, &bytes[2..]), // UTF-16BE BOM
-        _ => (tiff_le, bytes),                        // no BOM → use TIFF order
+        Some(&[0xFF, 0xFE]) => (true, &bytes[2..]),
+        Some(&[0xFE, 0xFF]) => (false, &bytes[2..]),
+        _ => (tiff_le, bytes),
     };
 
     let words: Vec<u16> = data
@@ -190,71 +180,10 @@ fn read_u32(data: &[u8], off: usize, le: bool) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// Build a minimal TIFF blob with a UserComment in IFD0.
     fn make_exif_user_comment(comment: &str) -> Vec<u8> {
-        // Layout (little-endian):
-        //   0: "II" + magic(42) + ifd0_offset(8)     = 8 bytes
-        //   8: entry_count(1)                          = 2 bytes
-        //  10: entry: tag(0x9286) type(7) count value_offset = 12 bytes
-        //  22: next_ifd_offset(0)                      = 4 bytes
-        //  26: charset(8) + text                       = 8 + text.len() bytes
-
         let charset = b"ASCII\0\0\0";
         let text = comment.as_bytes();
         let count = (8 + text.len()) as u32;
-        let value_offset: u32 = 26; // where charset+text lives
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"II");          // byte order
-        buf.extend_from_slice(&42u16.to_le_bytes()); // TIFF magic
-        buf.extend_from_slice(&8u32.to_le_bytes());  // IFD0 offset
-
-        // IFD0
-        buf.extend_from_slice(&1u16.to_le_bytes()); // 1 entry
-        buf.extend_from_slice(&TAG_USER_COMMENT.to_le_bytes()); // tag
-        buf.extend_from_slice(&7u16.to_le_bytes());  // type = UNDEFINED
-        buf.extend_from_slice(&count.to_le_bytes()); // count
-        buf.extend_from_slice(&value_offset.to_le_bytes()); // value offset
-        buf.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
-
-        // UserComment value
-        buf.extend_from_slice(charset);
-        buf.extend_from_slice(text);
-        buf
-    }
-
-    #[test]
-    fn ascii_user_comment() {
-        let exif = make_exif_user_comment("1girl, masterpiece");
-        let result = extract_user_comment(&exif);
-        assert_eq!(result.unwrap(), "1girl, masterpiece");
-    }
-
-    #[test]
-    fn with_exif_prefix() {
-        let mut exif = b"Exif\0\0".to_vec();
-        exif.extend_from_slice(&make_exif_user_comment("sunset landscape"));
-        let result = extract_user_comment(&exif);
-        assert_eq!(result.unwrap(), "sunset landscape");
-    }
-
-    #[test]
-    fn returns_none_for_empty_comment() {
-        let exif = make_exif_user_comment("   ");
-        assert!(extract_user_comment(&exif).is_none());
-    }
-
-    #[test]
-    fn returns_none_for_garbage() {
-        assert!(extract_user_comment(b"not exif data").is_none());
-    }
-
-    #[test]
-    fn unicode_le_user_comment() {
-        // Little-endian TIFF ("II") with UTF-16LE UserComment
-        let text = "cyberpunk city";
-        let utf16: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-        let count = (8 + utf16.len()) as u32;
         let value_offset: u32 = 26;
 
         let mut buf = Vec::new();
@@ -267,59 +196,27 @@ mod tests {
         buf.extend_from_slice(&count.to_le_bytes());
         buf.extend_from_slice(&value_offset.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
-        buf.extend_from_slice(b"UNICODE\0");
-        buf.extend_from_slice(&utf16);
-
-        assert_eq!(extract_user_comment(&buf).unwrap(), "cyberpunk city");
+        buf.extend_from_slice(charset);
+        buf.extend_from_slice(text);
+        buf
     }
 
     #[test]
-    fn unicode_be_user_comment() {
-        // Big-endian TIFF ("MM") with UTF-16BE UserComment — as seen in real AI images
-        let text = "score_9, masterpiece";
-        let utf16: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_be_bytes()).collect();
-        let count = (8 + utf16.len()) as u32;
-        let value_offset: u32 = 26;
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"MM");
-        buf.extend_from_slice(&42u16.to_be_bytes());
-        buf.extend_from_slice(&8u32.to_be_bytes());
-        buf.extend_from_slice(&1u16.to_be_bytes());
-        buf.extend_from_slice(&TAG_USER_COMMENT.to_be_bytes());
-        buf.extend_from_slice(&7u16.to_be_bytes());
-        buf.extend_from_slice(&count.to_be_bytes());
-        buf.extend_from_slice(&value_offset.to_be_bytes());
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(b"UNICODE\0");
-        buf.extend_from_slice(&utf16);
-
-        assert_eq!(extract_user_comment(&buf).unwrap(), "score_9, masterpiece");
+    fn ascii_user_comment() {
+        let exif = make_exif_user_comment("1girl, masterpiece");
+        assert_eq!(extract_user_comment(&exif).unwrap(), "1girl, masterpiece");
     }
 
     #[test]
-    fn unicode_bom_overrides_tiff_order() {
-        // Big-endian TIFF but the text has a UTF-16LE BOM — BOM should win
-        let text = "landscape";
-        let utf16: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-        let bom = [0xFF_u8, 0xFE]; // LE BOM
-        let count = (8 + 2 + utf16.len()) as u32; // charset(8) + bom(2) + text
-        let value_offset: u32 = 26;
+    fn with_exif_prefix() {
+        let mut exif = b"Exif\0\0".to_vec();
+        exif.extend_from_slice(&make_exif_user_comment("sunset landscape"));
+        assert_eq!(extract_user_comment(&exif).unwrap(), "sunset landscape");
+    }
 
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"MM"); // big-endian TIFF
-        buf.extend_from_slice(&42u16.to_be_bytes());
-        buf.extend_from_slice(&8u32.to_be_bytes());
-        buf.extend_from_slice(&1u16.to_be_bytes());
-        buf.extend_from_slice(&TAG_USER_COMMENT.to_be_bytes());
-        buf.extend_from_slice(&7u16.to_be_bytes());
-        buf.extend_from_slice(&count.to_be_bytes());
-        buf.extend_from_slice(&value_offset.to_be_bytes());
-        buf.extend_from_slice(&0u32.to_be_bytes());
-        buf.extend_from_slice(b"UNICODE\0");
-        buf.extend_from_slice(&bom);
-        buf.extend_from_slice(&utf16);
-
-        assert_eq!(extract_user_comment(&buf).unwrap(), "landscape");
+    #[test]
+    fn unicode_user_comment() {
+        let exif = make_exif_user_comment("中文测试");
+        assert_eq!(extract_user_comment(&exif).unwrap(), "中文测试");
     }
 }

@@ -124,18 +124,25 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                 prompt: value.to_string(),
                 generator: Generator::A1111,
                 metadata_key: keyword.to_string(),
+                raw_metadata: None,
+                details: None,
             });
         }
         "prompt" => {
             match serde_json::from_str::<serde_json::Value>(value) {
                 Ok(json) => {
+                    // Extract both prompts and details from ComfyUI workflow
                     let prompts = comfyui::extract_from_workflow(&json);
-                    if !prompts.is_empty() {
+                    let details = comfyui::extract_details_from_workflow(&json);
+                    
+                    if !prompts.is_empty() || details.model.is_some() || !details.loras.is_empty() || details.positive_prompt.is_some() || details.negative_prompt.is_some() {
                         results.push(PromptRecord {
                             path: path.to_path_buf(),
                             prompt: prompts.join(" | "),
                             generator: Generator::ComfyUI,
                             metadata_key: keyword.to_string(),
+                            raw_metadata: Some(value.to_string()),
+                            details: Some(details),
                         });
                     }
                 }
@@ -147,6 +154,8 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                             prompt: value.to_string(),
                             generator: Generator::Unknown,
                             metadata_key: keyword.to_string(),
+                            raw_metadata: None,
+                            details: None,
                         });
                     }
                 }
@@ -161,6 +170,8 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                             prompt: prompt.to_string(),
                             generator: Generator::NovelAI,
                             metadata_key: keyword.to_string(),
+                            raw_metadata: None,
+                            details: None,
                         });
                     }
                 }
@@ -171,6 +182,8 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                             prompt: value.to_string(),
                             generator: Generator::Unknown,
                             metadata_key: keyword.to_string(),
+                            raw_metadata: None,
+                            details: None,
                         });
                     }
                 }
@@ -183,6 +196,8 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                     prompt: value.to_string(),
                     generator: Generator::NovelAI,
                     metadata_key: keyword.to_string(),
+                    raw_metadata: None,
+                    details: None,
                 });
             }
         }

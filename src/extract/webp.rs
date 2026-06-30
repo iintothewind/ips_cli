@@ -64,17 +64,33 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
                         prompt,
                         generator,
                         metadata_key: "XMP".to_string(),
+                        raw_metadata: None,
+                        details: None,
                     });
                 }
             }
             b"EXIF" => {
-                if let Some(prompt) = exif::extract_user_comment(chunk_data) {
-                    results.push(PromptRecord {
-                        path: path.to_path_buf(),
-                        prompt,
-                        generator: Generator::Unknown,
-                        metadata_key: "UserComment".to_string(),
-                    });
+                if let Some(raw_meta) = exif::extract_raw_metadata(chunk_data) {
+                    if let Some(prompt) = exif::extract_user_comment(chunk_data) {
+                        // Detect generator from metadata
+                        // WebP EXIF format: check for A1111 vs ComfyUI markers
+                        let generator = if raw_meta.contains("ckpt_name") {
+                            Generator::ComfyUI
+                        } else if raw_meta.contains("positive_prompt") || raw_meta.contains("Steps:") {
+                            Generator::A1111
+                        } else {
+                            Generator::Unknown
+                        };
+                        
+                        results.push(PromptRecord {
+                            path: path.to_path_buf(),
+                            prompt,
+                            generator,
+                            metadata_key: "UserComment".to_string(),
+                            raw_metadata: Some(raw_meta),
+                            details: None, // WebP details not fully implemented yet
+                        });
+                    }
                 }
             }
             _ => {}

@@ -127,6 +127,7 @@ fn main() {
     }
 
     // Phase 2 & 3: extract prompts and match in parallel
+    // Standard mode: extract, match, and output
     let mut results: Vec<_> = files
         .par_iter()
         .flat_map(|path| {
