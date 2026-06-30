@@ -6,7 +6,6 @@ struct JsonRecord {
     path: String,
     #[serde(rename = "generator")]
     generator: String,
-    prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     score: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,7 +26,6 @@ pub fn output(results: &[MatchResult], _config: &Config) {
             JsonRecord {
                 path: r.record.path.to_string_lossy().into_owned(),
                 generator: r.record.generator.to_string(),
-                prompt: r.record.prompt.clone(),
                 score: r.score,
                 model: details.model,
                 loras: details.loras,

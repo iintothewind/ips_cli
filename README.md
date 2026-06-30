@@ -126,7 +126,6 @@ Use `-p` / `--path-only` to print only paths (works in structured mode too).
   {
     "path": "./assets/cyberpunk_city.png",
     "generator": "a1111",
-    "prompt": "a detailed photo of a cyberpunk city at night, neon lights...",
     "model": "realisticVision.safetensors",
     "loras": [{"name": "style", "weight": "0.7"}],
     "positive_prompt": "a detailed photo of a cyberpunk city...",
@@ -136,18 +135,18 @@ Use `-p` / `--path-only` to print only paths (works in structured mode too).
 ]
 ```
 
-- `prompt` is always the full searchable text from metadata.
-- `model`, `loras`, `positive_prompt`, and `negative_prompt` are omitted when empty.
+- `positive_prompt` and `negative_prompt` are omitted when empty.
+- `model`, `loras` are omitted when empty.
 - `score` is only present in fuzzy mode.
 
 ### CSV (`-f csv`)
 
 ```
-path,generator,prompt,score
-./assets/cyberpunk_city.png,a1111,"a detailed photo of a cyberpunk city...",
+path,generator,positive_prompt,negative_prompt,score
+./assets/cyberpunk_city.png,a1111,"a detailed photo of a cyberpunk city...","blurry, low quality",
 ```
 
-Structured fields are not included in CSV output (use JSON for that).
+`model` and `loras` are not included in CSV output (use JSON for those).
 
 ## Performance
 
