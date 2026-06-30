@@ -1,6 +1,8 @@
 use std::io::{BufReader, Read};
 use std::path::Path;
 
+use flate2::read::ZlibDecoder;
+
 use crate::types::{Generator, PromptRecord};
 use super::{a1111, comfyui};
 
@@ -88,10 +90,12 @@ fn parse_itxt_chunk(data: &[u8]) -> Option<(String, String)> {
     let kw_end = data.iter().position(|&b| b == 0)?;
     let keyword = String::from_utf8_lossy(&data[..kw_end]).into_owned();
 
-    let mut pos = kw_end + 3;
-    if pos > data.len() {
+    let mut pos = kw_end + 1;
+    if pos + 1 >= data.len() {
         return None;
     }
+    let compression_flag = data[pos];
+    pos += 2; // skip compression flag + method
 
     let lang_end = data[pos..].iter().position(|&b| b == 0)?;
     pos += lang_end + 1;
@@ -99,8 +103,20 @@ fn parse_itxt_chunk(data: &[u8]) -> Option<(String, String)> {
     let trans_end = data[pos..].iter().position(|&b| b == 0)?;
     pos += trans_end + 1;
 
-    let value = String::from_utf8_lossy(&data[pos..]).into_owned();
+    let raw = &data[pos..];
+    let value = if compression_flag == 1 {
+        inflate_zlib(raw)?
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    };
     Some((keyword, value))
+}
+
+fn inflate_zlib(data: &[u8]) -> Option<String> {
+    let mut decoder = ZlibDecoder::new(data);
+    let mut buf = Vec::new();
+    decoder.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<PromptRecord>) {
@@ -114,32 +130,8 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
                 a1111::extract_details(value),
             ));
         }
-        "prompt" => {
-            match serde_json::from_str::<serde_json::Value>(value) {
-                Ok(json) => {
-                    let (prompt, details) = comfyui::extract_workflow(&json);
-                    if comfyui::has_extractable_content(&prompt, &details) {
-                        results.push(PromptRecord::with_details(
-                            path.to_path_buf(),
-                            prompt,
-                            Generator::ComfyUI,
-                            keyword,
-                            details,
-                        ));
-                    }
-                }
-                Err(_) => {
-                    if !value.trim().is_empty() {
-                        results.push(PromptRecord::with_details(
-                            path.to_path_buf(),
-                            value.to_string(),
-                            Generator::Unknown,
-                            keyword,
-                            a1111::extract_details(value),
-                        ));
-                    }
-                }
-            }
+        "prompt" | "workflow" => {
+            push_comfyui_record(path, keyword, value, results);
         }
         "Comment" => {
             match serde_json::from_str::<serde_json::Value>(value) {
@@ -179,6 +171,34 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
             }
         }
         _ => {}
+    }
+}
+
+fn push_comfyui_record(path: &Path, keyword: &str, value: &str, results: &mut Vec<PromptRecord>) {
+    match serde_json::from_str::<serde_json::Value>(value) {
+        Ok(json) => {
+            let (prompt, details) = comfyui::extract_workflow(&json);
+            if comfyui::has_extractable_content(&prompt, &details) {
+                results.push(PromptRecord::with_details(
+                    path.to_path_buf(),
+                    prompt,
+                    Generator::ComfyUI,
+                    keyword,
+                    details,
+                ));
+            }
+        }
+        Err(_) => {
+            if !value.trim().is_empty() {
+                results.push(PromptRecord::with_details(
+                    path.to_path_buf(),
+                    value.to_string(),
+                    Generator::Unknown,
+                    keyword,
+                    a1111::extract_details(value),
+                ));
+            }
+        }
     }
 }
 
@@ -222,6 +242,23 @@ mod tests {
             records[0].details_or_default().model.as_deref(),
             Some("base.safetensors")
         );
+    }
+
+    #[test]
+    fn extracts_comfyui_from_workflow_keyword() {
+        let workflow = r#"{"1":{"class_type":"TextEncodeQwenImageEditPlus","inputs":{"prompt":"workflow keyword prompt"}}}"#;
+        let mut data = b"workflow\x00".to_vec();
+        data.extend_from_slice(workflow.as_bytes());
+        let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &data)]);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.png");
+        std::fs::write(&path, &png_bytes).unwrap();
+
+        let records = extract(&path, false);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].generator, Generator::ComfyUI);
+        assert_eq!(records[0].prompt, "workflow keyword prompt");
     }
 
     #[test]
