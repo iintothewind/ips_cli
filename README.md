@@ -34,8 +34,7 @@ ips [OPTIONS] --query <QUERY> [PATH]
 | `--fuzzy` | Fuzzy matching instead of exact substring |
 | `--regex` | Regex matching |
 | `--min-score <N>` | Minimum fuzzy match score (default: `50`) |
-| `--structured` | Show model, LoRAs, and positive/negative prompts in console mode |
-| `--full` | Do not truncate long prompts; also enables structured console output |
+| `--full` | Show full prompt text (no truncation) with structured fields (model, LoRAs, prompts) |
 | `-p, --path-only` | Print only matching file paths (no prompt text) |
 | `--depth <N>` | Max directory recursion depth |
 | `--no-recursive` | Only search the top-level directory |
@@ -53,7 +52,7 @@ ips -q "cyberpunk"
 ips -q "sunset landscape" --fuzzy ./ai_art
 
 # Structured console output (model, loras, prompts)
-ips -q "masterpiece" --structured ./images
+ips -q "masterpiece" --full ./images
 
 # List matching files only
 ips -q "1girl" -p ./outputs
@@ -101,7 +100,7 @@ Highlights matched text in context with the file path and detected generator:
 
 Long prompts are truncated to a ±80 character window around the match unless `--full` is set.
 
-### Structured console (`--structured` or `--full`)
+### Structured console (`--full`)
 
 Prints parsed metadata fields instead of the context window:
 

@@ -83,7 +83,7 @@ Each raw text blob is routed to:
 Output: Vec<PromptRecord>  (0..N records per file; see §4.8)
 ```
 
-Structured details (`PromptDetails`: model, loras, positive/negative prompts) are populated **at extraction time** and stored on `PromptRecord.details`. Output layers (JSON, `--structured` console) read this directly — no second-pass parsing.
+Structured details (`PromptDetails`: model, loras, positive/negative prompts) are populated **at extraction time** and stored on `PromptRecord.details`. Output layers (JSON, `--full` console) read this directly — no second-pass parsing.
 
 ---
 
@@ -467,11 +467,11 @@ Rules:
 - File path in bold/bright.
 - Generator tag in brackets (dimmed).
 - Prompt text shows a **context window** of ±80 characters around the first match. Matched text is highlighted (bold + color).
-- If `--full` flag is set, print the entire prompt without truncation (also enables structured mode for backward compatibility).
+- If `--full` flag is set, print the entire prompt without truncation and show structured fields (model, LoRAs, prompts).
 - Long prompts (>500 chars) are truncated with `...` on both ends unless `--full` is specified.
 - Truncation is UTF-8 safe (character boundaries, not byte slices).
 
-### Structured Console (`--structured`, or `--full`)
+### Structured Console (`--full`)
 
 When enabled, each match prints parsed fields in addition to the context window:
 
@@ -534,8 +534,7 @@ Options:
       --fuzzy               Enable fuzzy matching (default is exact substring)
       --regex               Enable regex matching
       --min-score <N>       Minimum fuzzy match score, 0-100 [default: 50]
-      --full                Show full prompt text (no truncation); also enables structured mode
-      --structured          Show model, loras, positive/negative prompts in console mode
+      --full                Show full prompt text (no truncation) with structured fields (model, loras, prompts)
   -p, --path-only           Print only file paths (no prompt text)
       --depth <N>           Maximum directory recursion depth [default: unlimited]
       --no-recursive        Disable recursive directory traversal
@@ -556,7 +555,7 @@ ips -q "cyberpunk"
 ips -q "sunset landscape" --fuzzy ./ai_art
 
 # Structured console output with parsed fields
-ips -q "sunset" --structured ./ai_art
+ips -q "sunset" --full ./ai_art
 
 # Export to JSON (includes structured fields when present)
 ips -q "masterpiece" -f json ./images > results.json
@@ -663,7 +662,7 @@ pub struct MatchResult {
 }
 ```
 
-Structured details are populated during extraction (`a1111::extract_details`, `comfyui::extract_workflow`) and consumed directly by JSON output and `--structured` console — there is no second-pass parsing at output time.
+Structured details are populated during extraction (`a1111::extract_details`, `comfyui::extract_workflow`) and consumed directly by JSON output and `--full` console — there is no second-pass parsing at output time.
 
 ---
 
