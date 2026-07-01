@@ -7,7 +7,7 @@ use crate::types::{Config, MatchResult, OutputFormat};
 pub fn output_results(results: &[MatchResult], config: &Config) {
     match config.format {
         OutputFormat::Console => {
-            if config.structured {
+            if config.full {
                 let structured: Vec<_> = results.iter().map(|r| r.record.to_structured()).collect();
                 console::output_structured(&structured, config);
             } else {

@@ -116,7 +116,6 @@ pub struct Config {
     pub match_mode: MatchMode,
     pub min_score: i64,
     pub full: bool,
-    pub structured: bool,
     pub depth: Option<usize>,
     pub no_recursive: bool,
     pub threads: Option<usize>,

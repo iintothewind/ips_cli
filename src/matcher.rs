@@ -117,7 +117,6 @@ mod tests {
             match_mode: mode,
             min_score: 50,
             full: false,
-            structured: false,
             depth: None,
             no_recursive: false,
             threads: None,

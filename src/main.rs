@@ -35,11 +35,7 @@ struct Args {
     #[arg(long, default_value = "50")]
     min_score: i64,
 
-    /// Show structured fields (model, loras, positive/negative prompts) in console mode
-    #[arg(long)]
-    structured: bool,
-
-    /// Do not truncate long prompt text in console output
+    /// Do not truncate long prompt text in console output; also enables structured mode
     #[arg(long)]
     full: bool,
 
@@ -96,10 +92,9 @@ fn main() {
         }
     }
 
-    // --full historically enabled structured output; keep compatible.
-    let structured = args.structured || args.full;
     let no_color = args.no_color || std::env::var("NO_COLOR").is_ok();
 
+    // --full enables structured output and full prompt display (no truncation)
     let config = Config {
         query: args.query,
         path: args.path,
@@ -107,7 +102,6 @@ fn main() {
         match_mode,
         min_score: args.min_score,
         full: args.full,
-        structured,
         depth: args.depth,
         no_recursive: args.no_recursive,
         threads: args.threads,
