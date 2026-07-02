@@ -7,7 +7,14 @@
       "Bash(powershell -Command ':*)",
       "Bash(Out-String)",
       "Bash(powershell -Command \"Set-Location 'C:\\\\Users\\\\user02\\\\code\\\\image_prompt_search'; & 'C:\\\\Users\\\\user02\\\\.cargo\\\\bin\\\\cargo.exe' build 2>&1 | Select-String 'error|Finished'\")",
-      "Bash(cargo build:*)"
+      "Bash(cargo build:*)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(cargo build *)",
+      "PowerShell(cargo test *)",
+      "PowerShell($env:PATH = \"$env:USERPROFILE\\\\.cargo\\\\bin;$env:PATH\"; Set-Location C:\\\\Users\\\\ivarc\\\\Documents\\\\code\\\\ips_cli; ls tests/examples/ 2>&1)",
+      "PowerShell(git ls-files *)",
+      "PowerShell(& \"C:\\\\Users\\\\ivarc\\\\.cargo\\\\bin\\\\cargo.exe\" build 2>&1)",
+      "PowerShell(& \"C:\\\\Users\\\\ivarc\\\\.cargo\\\\bin\\\\cargo.exe\" test 2>&1)"
     ]
   }
 }

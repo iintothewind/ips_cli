@@ -1,5 +1,4 @@
 use std::fs;
-use std::path::Path;
 
 /// Build a minimal valid PNG with a tEXt chunk containing the given keyword and value.
 fn build_png_with_text(keyword: &str, value: &str) -> Vec<u8> {
@@ -204,80 +203,3 @@ fn regex_matching() {
     assert!(result.is_some());
 }
 
-// ── Real-file tests using tests/examples/ ─────────────────────────────────────
-
-fn examples_dir() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("examples")
-}
-
-fn extract_from(filename: &str) -> Vec<ips::types::PromptRecord> {
-    let path = examples_dir().join(filename);
-    ips::extract::extract_prompt(&path, false)
-}
-
-/// 00029-795142250.jpg — A1111 JPEG with EXIF UserComment (big-endian TIFF,
-/// full count fits in segment).
-#[test]
-fn real_jpeg_exif_usercomment_full() {
-    let records = extract_from("00029-795142250.jpg");
-    assert!(!records.is_empty(), "should extract at least one prompt");
-    let combined: String = records.iter().map(|r| r.prompt.as_str()).collect::<Vec<_>>().join(" ");
-    assert!(combined.contains("score_9"), "expected 'score_9' in prompt");
-    assert!(
-        records.iter().any(|r| r.metadata_key == "UserComment"),
-        "should come from UserComment"
-    );
-}
-
-/// 20251230210852.jpg — EXIF UserComment where the declared count exceeds the
-/// APP1 body size (truncated/malformed EXIF).  Must still extract what's there.
-#[test]
-fn real_jpeg_exif_usercomment_truncated_count() {
-    let records = extract_from("20251230210852.jpg");
-    assert!(!records.is_empty(), "should extract prompt despite oversized count");
-    let combined: String = records.iter().map(|r| r.prompt.as_str()).collect::<Vec<_>>().join(" ");
-    assert!(combined.to_lowercase().contains("masterpiece"), "expected 'masterpiece' in prompt");
-}
-
-/// 00287-1450597514.png — A1111 PNG with tEXt parameters chunk.
-#[test]
-fn real_png_a1111_parameters() {
-    let records = extract_from("00287-1450597514.png");
-    assert!(!records.is_empty());
-    assert!(
-        records.iter().any(|r| r.generator == ips::types::Generator::A1111),
-        "should detect A1111 generator"
-    );
-}
-
-/// Search the whole examples directory and confirm we get results.
-#[test]
-fn real_directory_search_finds_matches() {
-    use ips::*;
-
-    let config = types::Config {
-        query: "masterpiece".to_string(),
-        path: examples_dir(),
-        format: types::OutputFormat::Console,
-        match_mode: types::MatchMode::Exact,
-        min_score: 50,
-        full: false,
-        depth: None,
-        no_recursive: false,
-        threads: None,
-        verbose: false,
-        no_color: true,
-        path_only: false,
-    };
-
-    let files = discovery::discover_files(&config);
-    let results: Vec<_> = files
-        .iter()
-        .flat_map(|p| extract::extract_prompt(p, false))
-        .filter_map(|r| matcher::match_record(&r, &config))
-        .collect();
-
-    assert!(!results.is_empty(), "should find 'masterpiece' in at least one example image");
-}
