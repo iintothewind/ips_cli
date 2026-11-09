@@ -4,6 +4,8 @@ A fast CLI tool to search AI-generated image prompts embedded in local image met
 
 Extracts searchable prompt text plus structured fields (model, LoRAs, positive/negative prompts) when available.
 
+ComfyUI conditioning references carry their **output slot**: slot 0 is the positive stream, slot ≥ 1 the negative one. A node that encodes both prompts in a single pass (`TextEncodeQwenImage21`) therefore reports its own `negative_prompt` instead of duplicating the positive prompt.
+
 ## Installation
 
 ```bash

@@ -210,7 +210,7 @@ pub fn extract_from_workflow(json: &Value) -> Vec<String> {
         };
 
         // CLIPTextEncodeSDXL uses text_g and text_l
-        for field in &["text_g", "text_l", "text", "prompt"] {
+        for field in &["text_g", "text_l", "text", "prompt", "neg", "negative_prompt"] {
             if let Some(text) = inputs.get(*field).and_then(|v| v.as_str()) {
                 let text = text.trim().to_string();
                 if !text.is_empty() && !prompts.contains(&text) {
@@ -275,14 +275,14 @@ pub fn extract_details_from_workflow(json: &Value) -> PromptDetails {
         if details.positive_prompt.is_none() {
             details.positive_prompt = inputs
                 .get("positive")
-                .and_then(ref_node_id)
-                .and_then(|id| resolve_conditioning_text(&normalized, &id, PromptRole::Positive));
+                .and_then(ref_cond)
+                .and_then(|cond| resolve_conditioning_text(&normalized, &cond, PromptRole::Positive));
         }
         if details.negative_prompt.is_none() {
             details.negative_prompt = inputs
                 .get("negative")
-                .and_then(ref_node_id)
-                .and_then(|id| resolve_conditioning_text(&normalized, &id, PromptRole::Negative));
+                .and_then(ref_cond)
+                .and_then(|cond| resolve_conditioning_text(&normalized, &cond, PromptRole::Negative));
         }
 
         if details.positive_prompt.is_some() || details.negative_prompt.is_some() {
@@ -414,63 +414,115 @@ fn format_lora_weight(model_weight: Option<&str>, clip_weight: Option<&str>) -> 
     }
 }
 
+struct CondRef {
+    id: String,
+    index: u64,
+}
+
 #[derive(Clone, Copy)]
 enum PromptRole {
     Positive,
     Negative,
 }
 
-fn resolve_conditioning_text(json: &Value, node_id: &str, role: PromptRole) -> Option<String> {
+fn resolve_conditioning_text(json: &Value, cond: &CondRef, role: PromptRole) -> Option<String> {
     let mut visited = HashSet::new();
-    resolve_conditioning_text_inner(json, node_id, role, &mut visited)
+    resolve_conditioning_text_inner(json, cond, role, &mut visited)
 }
 
 fn resolve_conditioning_text_inner(
     json: &Value,
-    node_id: &str,
+    cond: &CondRef,
     role: PromptRole,
-    visited: &mut HashSet<String>,
+    visited: &mut HashSet<(String, u64)>,
 ) -> Option<String> {
-    if !visited.insert(node_id.to_string()) {
+    if !visited.insert((cond.id.clone(), cond.index)) {
         return None;
     }
 
-    let node = json.as_object()?.get(node_id)?;
+    let node = json.as_object()?.get(&cond.id)?;
     let class_type = node.get("class_type").and_then(|v| v.as_str()).unwrap_or_default();
     if class_type.contains("ZeroOut") {
         return None;
     }
 
+    // Output slot 1 of a conditioning node is the negative stream: its text comes from the
+    // node's negative field, never from the shared positive field.
+    let negative_stream = cond.index > 0;
+    let role = if negative_stream {
+        PromptRole::Negative
+    } else {
+        role
+    };
+
     if is_text_encode_node(class_type) {
-        if let Some(text) = extract_text_from_node(node) {
-            return Some(text);
+        let text = if negative_stream {
+            extract_text_from_node(node, NEGATIVE_TEXT_FIELDS)
+        } else {
+            // Slot 0 encodes the node's main prompt whichever sampler input it feeds; role-named
+            // fields are only a fallback for nodes without the standard prompt fields.
+            extract_text_from_node(node, PROMPT_TEXT_FIELDS).or_else(|| match role {
+                PromptRole::Positive => extract_text_from_node(node, &["positive"]),
+                PromptRole::Negative => extract_text_from_node(node, NEGATIVE_TEXT_FIELDS),
+            })
+        };
+        if text.is_some() {
+            return text;
         }
     }
 
     let inputs = node.get("inputs").and_then(|v| v.as_object())?;
-    let role_field = match role {
-        PromptRole::Positive => "positive",
-        PromptRole::Negative => "negative",
-    };
-
-    for field in [role_field, "conditioning", "cond"] {
-        if let Some(next_id) = inputs.get(field).and_then(ref_node_id) {
-            if let Some(text) = resolve_conditioning_text_inner(json, &next_id, role, visited) {
-                return Some(text);
-            }
+    for &field in input_fields_for(role) {
+        let Some(next) = inputs.get(field).and_then(ref_cond) else {
+            continue;
+        };
+        let next_role = field_role(field).unwrap_or(role);
+        if let Some(text) = resolve_conditioning_text_inner(json, &next, next_role, visited) {
+            return Some(text);
         }
     }
 
     None
 }
 
-fn extract_text_from_node(node: &Value) -> Option<String> {
+const PROMPT_TEXT_FIELDS: &[&str] = &["text_g", "text_l", "text", "prompt"];
+const NEGATIVE_TEXT_FIELDS: &[&str] = &["neg", "negative_prompt", "negative"];
+
+fn input_fields_for(role: PromptRole) -> &'static [&'static str] {
+    match role {
+        PromptRole::Positive => &[
+            "positive",
+            "conditioning",
+            "conditioning1",
+            "conditioning2",
+            "cond",
+        ],
+        PromptRole::Negative => &[
+            "negative",
+            "neg",
+            "conditioning",
+            "conditioning1",
+            "conditioning2",
+            "cond",
+        ],
+    }
+}
+
+fn field_role(field: &str) -> Option<PromptRole> {
+    match field {
+        "positive" | "positive_prompt" => Some(PromptRole::Positive),
+        "negative" | "negative_prompt" | "neg" => Some(PromptRole::Negative),
+        _ => None,
+    }
+}
+
+fn extract_text_from_node(node: &Value, fields: &[&str]) -> Option<String> {
     let inputs = node.get("inputs").and_then(|v| v.as_object())?;
     let mut parts = Vec::new();
 
-    for field in ["text_g", "text_l", "text", "prompt"] {
+    for field in fields {
         if let Some(text) = inputs
-            .get(field)
+            .get(*field)
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -506,10 +558,11 @@ fn is_text_encode_node(class_type: &str) -> bool {
         || class_type.contains("TextEncode")
 }
 
-fn ref_node_id(value: &Value) -> Option<String> {
+fn ref_cond(value: &Value) -> Option<CondRef> {
     let array = value.as_array()?;
-    let id = array.first()?;
-    value_to_string(id).and_then(non_empty)
+    let id = array.first().and_then(value_to_string).and_then(non_empty)?;
+    let index = array.get(1).and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(CondRef { id, index })
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
@@ -654,6 +707,157 @@ mod tests {
         assert_eq!(details.loras[0].name, "qwen\\image_edit_f2p_qwen.safetensors");
         assert_eq!(details.positive_prompt.as_deref(), Some("qwen positive prompt"));
         assert_eq!(details.negative_prompt, None);
+    }
+
+    #[test]
+    fn shared_encode_node_negative_output_is_not_the_positive_prompt() {
+        let workflow = json!({
+            "1": {
+                "class_type": "TextEncodeQwenImage21",
+                "inputs": { "prompt": "a woman in a floral dress", "negative_prompt": "" }
+            },
+            "2": {
+                "class_type": "KSampler",
+                "inputs": { "positive": ["1", 0], "negative": ["1", 1] }
+            }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(
+            details.positive_prompt.as_deref(),
+            Some("a woman in a floral dress")
+        );
+        assert_eq!(details.negative_prompt, None);
+    }
+
+    #[test]
+    fn shared_encode_node_negative_output_text() {
+        let workflow = json!({
+            "1": {
+                "class_type": "TextEncodeQwenImage21",
+                "inputs": { "prompt": "portrait", "negative_prompt": "blurry, low quality" }
+            },
+            "2": {
+                "class_type": "CFGGuider",
+                "inputs": { "positive": ["1", 0], "negative": ["1", 1] }
+            }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(details.positive_prompt.as_deref(), Some("portrait"));
+        assert_eq!(
+            details.negative_prompt.as_deref(),
+            Some("blurry, low quality")
+        );
+    }
+
+    #[test]
+    fn zero_out_negative_stream_has_no_negative_prompt() {
+        let workflow = json!({
+            "1": { "class_type": "CLIPTextEncode", "inputs": { "text": "positive text" } },
+            "2": {
+                "class_type": "ConditioningZeroOut",
+                "inputs": { "conditioning": ["1", 0] }
+            },
+            "3": {
+                "class_type": "KSampler",
+                "inputs": { "positive": ["1", 0], "negative": ["2", 0] }
+            }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(details.positive_prompt.as_deref(), Some("positive text"));
+        assert_eq!(details.negative_prompt, None);
+    }
+
+    #[test]
+    fn propagates_negative_role_through_conditioning_chain() {
+        let workflow = json!({
+            "1": { "class_type": "CLIPTextEncode", "inputs": { "text": "negative text" } },
+            "2": {
+                "class_type": "Conditioning (Set Strength)",
+                "inputs": { "strength": 1.0, "conditioning": ["1", 0] }
+            },
+            "3": { "class_type": "CLIPTextEncode", "inputs": { "text": "positive text" } },
+            "4": {
+                "class_type": "KSampler",
+                "inputs": { "positive": ["3", 0], "negative": ["2", 0] }
+            }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(details.positive_prompt.as_deref(), Some("positive text"));
+        assert_eq!(details.negative_prompt.as_deref(), Some("negative text"));
+    }
+
+    #[test]
+    fn qwen_encode_used_as_negative_keeps_its_prompt_field() {
+        let workflow = json!({
+            "1": {
+                "class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": { "prompt": "blurry, deformed" }
+            },
+            "2": {
+                "class_type": "KSampler",
+                "inputs": { "positive": ["3", 0], "negative": ["1", 0] }
+            },
+            "3": { "class_type": "CLIPTextEncode", "inputs": { "text": "positive text" } }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(details.positive_prompt.as_deref(), Some("positive text"));
+        assert_eq!(details.negative_prompt.as_deref(), Some("blurry, deformed"));
+    }
+
+    #[test]
+    fn sdxl_negative_encode_reads_text_g_and_text_l() {
+        let workflow = json!({
+            "1": {
+                "class_type": "CLIPTextEncodeSDXL",
+                "inputs": { "text_g": "cat g", "text_l": "cat l" }
+            },
+            "2": {
+                "class_type": "CLIPTextEncodeSDXL",
+                "inputs": { "text_g": "blurry g", "text_l": "blurry l" }
+            },
+            "3": {
+                "class_type": "KSampler",
+                "inputs": { "positive": ["1", 0], "negative": ["2", 0] }
+            }
+        });
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(details.positive_prompt.as_deref(), Some("cat g\ncat l"));
+        assert_eq!(details.negative_prompt.as_deref(), Some("blurry g\nblurry l"));
+    }
+
+    #[test]
+    fn qwen21_shared_encode_node_fixture() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/qwen21_shared_encode.json"
+        ))
+        .unwrap();
+        let workflow: Value = serde_json::from_str(&raw).unwrap();
+
+        let details = extract_details_from_workflow(&workflow);
+        assert_eq!(
+            details.model.as_deref(),
+            Some("qwen_image_2.1_turbo_int8_convrot.safetensors")
+        );
+        assert_eq!(
+            details.positive_prompt.as_deref(),
+            Some("portrait of a woman in a floral dress, cinematic lighting")
+        );
+        assert_eq!(
+            details.negative_prompt, None,
+            "conditioning output slot 1 must not reuse the shared positive prompt"
+        );
+        assert_eq!(details.loras.len(), 1);
+        assert_eq!(details.loras[0].name, "qwen\\style_qwen21.safetensors");
+
+        let (prompt, _) = extract_workflow(&workflow);
+        assert_eq!(prompt, "portrait of a woman in a floral dress, cinematic lighting");
     }
 
     #[test]

@@ -219,7 +219,7 @@ Two parallel extractions merge into one `(prompt, PromptDetails)`:
 
 **A. Searchable prompt text** (for matching):
 1. Scan all nodes; collect non-empty strings from text-encode nodes (`CLIPTextEncode`, `CLIPTextEncodeSDXL`, `CLIPTextEncodeFlux`, `TextEncodeQwenImageEdit*`, any `class_type` containing `Prompt` or `TextEncode`).
-2. Fields checked per node: `text_g`, `text_l`, `text`, `prompt` (SDXL uses `_g` / `_l`).
+2. Fields checked per node: `text_g`, `text_l`, `text`, `prompt` (SDXL uses `_g` / `_l`), plus negative fields `neg`, `negative_prompt`.
 3. Deduplicate identical strings; join with `" | "`.
 4. **Fallback:** if step 1–3 yield nothing, join sampler-traced `positive_prompt` and `negative_prompt` with `" | "`.
 
@@ -228,14 +228,16 @@ Two parallel extractions merge into one `(prompt, PromptDetails)`:
 |---|---|
 | `model` | `CheckpointLoader*` / `UNETLoader` / `UnetLoaderGGUF` nodes → `inputs.ckpt_name` or `inputs.unet_name` |
 | `loras` | Any node whose `class_type` contains `"lora"` (case-insensitive). Standard `LoraLoader`: `lora_name` + weights. rgthree `Power Lora Loader`: object-valued inputs with `"lora"` key; skip if `"on": false`. |
-| `positive_prompt` / `negative_prompt` | First `KSampler*` or `CFGGuider` node → follow `inputs.positive` / `inputs.negative` node refs through conditioning graph |
+| `positive_prompt` / `negative_prompt` | First `KSampler*` or `CFGGuider` node → follow `inputs.positive` / `inputs.negative` node refs (id **and output slot**) through conditioning graph |
 
 **Conditioning graph walk** (`resolve_conditioning_text`):
-- Node refs are `["node_id", slot_index]` arrays — only first element used.
-- If target is text-encode node → extract text fields.
+- Node refs are `["node_id", slot_index]` arrays; the output slot travels with the reference (`CondRef { id, index }`).
+- Slot ≥ 1 is the negative stream: text comes only from `neg` / `negative_prompt` / `negative`, never from the shared positive field. A node that encodes both prompts in one pass (`TextEncodeQwenImage21`) yields its own negative text — nothing when `negative_prompt` is empty.
+- Slot 0 encodes the node's main prompt whichever sampler input it feeds: standard fields `text_g` / `text_l` / `text` / `prompt` first, then a role-named fallback (`positive`, or `neg` / `negative_prompt` / `negative` for a negative ref).
+- If target is text-encode node → extract the fields above.
 - If target is `ZeroOut` → return `None` (empty negative conditioning).
-- Else follow `inputs.positive` / `inputs.negative` / `inputs.conditioning`.
-- **Cycle guard:** `HashSet<String>` of visited node IDs.
+- Else follow role-specific input fields: positive → `positive`, `conditioning`, `conditioning1`, `conditioning2`, `cond`; negative → `negative`, `neg`, `conditioning`, `conditioning1`, `conditioning2`, `cond`. Role-named inputs reset the role for the next hop; neutral chain fields keep it.
+- **Cycle guard:** `HashSet<(String, u64)>` of visited node ID + slot pairs.
 
 #### ComfyUI fault scenarios
 
@@ -246,6 +248,7 @@ Two parallel extractions merge into one `(prompt, PromptDetails)`:
 | Node missing `class_type` or `inputs` | Skip node |
 | Text-encode nodes empty but model/loras present | Record created (`has_extractable_content`) |
 | Text-encode nodes empty, sampler trace finds prompts | Searchable prompt from sampler fallback |
+| Shared encode node feeding negative from output slot 1 (`TextEncodeQwenImage21`) | Negative role reads only negative fields; empty/absent → `negative_prompt` omitted, never the positive prompt |
 | Malformed `<lora:` tag in embedded A1111 text | `parse_loras` stops at first unclosed `>`; prior tags kept |
 | Disabled rgthree lora (`"on": false`) | Skipped |
 | Split model/clip lora weights | Stored as `"0.7 / 0.5"` string |
