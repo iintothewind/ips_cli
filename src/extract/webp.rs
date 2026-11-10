@@ -1,36 +1,23 @@
-use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::types::{Generator, PromptRecord};
-use super::{a1111, exif, jpeg};
+use crate::types::PromptRecord;
+use super::{a1111, jpeg, ByteSource};
 
-const RIFF_MAGIC: &[u8; 4] = b"RIFF";
-const WEBP_MAGIC: &[u8; 4] = b"WEBP";
+pub(super) const RIFF_MAGIC: &[u8; 4] = b"RIFF";
+pub(super) const WEBP_MAGIC: &[u8; 4] = b"WEBP";
 
-pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            if verbose {
-                eprintln!("ips: cannot read {}: {}", path.display(), e);
-            }
-            return vec![];
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-
+pub fn extract<R: ByteSource>(reader: &mut R, origin: &Path, verbose: bool) -> Vec<PromptRecord> {
     let mut header = [0u8; 12];
     if reader.read_exact(&mut header).is_err() {
         if verbose {
-            eprintln!("ips: {}: file too small to be a WebP", path.display());
+            eprintln!("ips: {}: file too small to be a WebP", origin.display());
         }
         return vec![];
     }
 
     if &header[0..4] != RIFF_MAGIC || &header[8..12] != WEBP_MAGIC {
         if verbose {
-            eprintln!("ips: {}: not a valid WebP", path.display());
+            eprintln!("ips: {}: not a valid WebP", origin.display());
         }
         return vec![];
     }
@@ -51,20 +38,22 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
 
         match chunk_id {
             b"XMP " => {
-                let mut chunk_data = vec![0u8; chunk_size];
-                if reader.read_exact(&mut chunk_data).is_err() {
-                    if verbose {
-                        eprintln!("ips: {}: truncated XMP chunk", path.display());
+                let chunk_data = match super::read_exact_vec(reader, chunk_size) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        if verbose {
+                            eprintln!("ips: {}: truncated XMP chunk", origin.display());
+                        }
+                        break;
                     }
-                    break;
-                }
+                };
                 if chunk_size & 1 != 0 {
-                    let _ = reader.seek(SeekFrom::Current(1));
+                    let _ = reader.skip(1);
                 }
                 if let Some(prompt) = jpeg::extract_xmp_description(&chunk_data) {
                     let generator = jpeg::detect_xmp_generator(&chunk_data);
                     results.push(PromptRecord::with_details(
-                        path.to_path_buf(),
+                        origin.to_path_buf(),
                         prompt.clone(),
                         generator,
                         "XMP",
@@ -73,28 +62,22 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
                 }
             }
             b"EXIF" => {
-                let mut chunk_data = vec![0u8; chunk_size];
-                if reader.read_exact(&mut chunk_data).is_err() {
-                    if verbose {
-                        eprintln!("ips: {}: truncated EXIF chunk", path.display());
+                let chunk_data = match super::read_exact_vec(reader, chunk_size) {
+                    Ok(data) => data,
+                    Err(_) => {
+                        if verbose {
+                            eprintln!("ips: {}: truncated EXIF chunk", origin.display());
+                        }
+                        break;
                     }
-                    break;
-                }
+                };
                 if chunk_size & 1 != 0 {
-                    let _ = reader.seek(SeekFrom::Current(1));
+                    let _ = reader.skip(1);
                 }
-                if let Some(prompt) = exif::extract_user_comment(&chunk_data) {
-                    results.push(PromptRecord::with_details(
-                        path.to_path_buf(),
-                        prompt.clone(),
-                        Generator::Unknown,
-                        "UserComment",
-                        a1111::extract_details(&prompt),
-                    ));
-                }
+                results.extend(super::exif_records(origin, &chunk_data, verbose));
             }
             _ => {
-                if reader.seek(SeekFrom::Current(padded_size as i64)).is_err() {
+                if reader.skip(padded_size as u64).is_err() {
                     break;
                 }
             }
@@ -107,6 +90,7 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extract::Stream;
 
     fn make_webp_with_xmp(xmp: &str) -> Vec<u8> {
         let xmp_bytes = xmp.as_bytes();
@@ -140,11 +124,7 @@ mod tests {
 </rdf:RDF>"#;
         let webp_bytes = make_webp_with_xmp(xmp);
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.webp");
-        std::fs::write(&path, &webp_bytes).unwrap();
-
-        let records = extract(&path, false);
+        let records = extract(&mut Stream(webp_bytes.as_slice()), Path::new("test.webp"), false);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].prompt, "sunset landscape, watercolor");
     }

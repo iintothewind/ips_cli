@@ -4,6 +4,7 @@ use serde::Serialize;
 /// A prompt extracted from a single image file.
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptRecord {
+    /// File path, or the URL exactly as given for remote images.
     pub path: PathBuf,
     pub prompt: String,
     pub generator: Generator,
@@ -124,7 +125,7 @@ pub struct Config {
     pub path_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum OutputFormat {
     Console,
     Json,
@@ -133,6 +134,8 @@ pub enum OutputFormat {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchMode {
+    /// No query: every record matches.
+    All,
     Exact,
     Fuzzy,
     Regex,

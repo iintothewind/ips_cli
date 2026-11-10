@@ -13,6 +13,11 @@ pub fn match_record(record: &PromptRecord, config: &Config) -> Option<MatchResul
         MatchMode::Exact => match_exact(record, config),
         MatchMode::Fuzzy => match_fuzzy(record, config),
         MatchMode::Regex => match_regex(record, config),
+        MatchMode::All => Some(MatchResult {
+            record: record.clone(),
+            score: None,
+            match_ranges: Vec::new(),
+        }),
     }
 }
 

@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use walkdir::WalkDir;
+use crate::extract::ImageFormat;
 use crate::types::Config;
-
-static IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
 pub fn discover_files(config: &Config) -> Vec<PathBuf> {
     let mut walker = WalkDir::new(&config.path).follow_links(false);
@@ -17,7 +16,7 @@ pub fn discover_files(config: &Config) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|entry| match entry {
             Ok(e) => {
-                if e.file_type().is_file() && is_image_file(e.path()) {
+                if e.file_type().is_file() && ImageFormat::from_extension(e.path()).is_some() {
                     Some(e.path().to_path_buf())
                 } else {
                     None
@@ -31,13 +30,6 @@ pub fn discover_files(config: &Config) -> Vec<PathBuf> {
             }
         })
         .collect()
-}
-
-fn is_image_file(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-        .unwrap_or(false)
 }
 
 #[cfg(test)]

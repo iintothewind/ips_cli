@@ -1,10 +1,10 @@
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 
 use crate::types::{Generator, PromptRecord};
-use super::{a1111, exif};
+use super::a1111;
 
-const SOI_MARKER: [u8; 2] = [0xFF, 0xD8];
+pub(super) const SOI_MARKER: [u8; 2] = [0xFF, 0xD8];
 const MARKER_PREFIX: u8 = 0xFF;
 const SOS_TYPE: u8 = 0xDA; // Start of Scan — image data begins after this
 const COM_TYPE: u8 = 0xFE; // Comment segment
@@ -12,24 +12,12 @@ const APP1_TYPE: u8 = 0xE1; // APP1 (XMP or EXIF)
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
 const EXIF_HEADER: &[u8] = b"Exif\0\0";
 
-pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            if verbose {
-                eprintln!("ips: cannot read {}: {}", path.display(), e);
-            }
-            return vec![];
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-
+pub fn extract<R: Read>(reader: &mut R, origin: &Path, verbose: bool) -> Vec<PromptRecord> {
     // Validate SOI marker
     let mut soi = [0u8; 2];
     if reader.read_exact(&mut soi).is_err() || soi != SOI_MARKER {
         if verbose {
-            eprintln!("ips: {}: not a valid JPEG", path.display());
+            eprintln!("ips: {}: not a valid JPEG", origin.display());
         }
         return vec![];
     }
@@ -76,7 +64,7 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
         let mut body = vec![0u8; body_len];
         if reader.read_exact(&mut body).is_err() {
             if verbose {
-                eprintln!("ips: {}: truncated JPEG segment", path.display());
+                eprintln!("ips: {}: truncated JPEG segment", origin.display());
             }
             break;
         }
@@ -86,13 +74,7 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
                 let text = String::from_utf8_lossy(&body).into_owned();
                 let text = text.trim().to_string();
                 if !text.is_empty() {
-                    results.push(PromptRecord::with_details(
-                        path.to_path_buf(),
-                        text.clone(),
-                        Generator::A1111,
-                        "COM",
-                        a1111::extract_details(&text),
-                    ));
+                    results.push(super::text_record(origin, "COM", text, Generator::A1111, verbose));
                 }
             }
             APP1_TYPE => {
@@ -101,7 +83,7 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
                     if let Some(prompt) = extract_xmp_description(xmp_body) {
                         let generator = detect_xmp_generator(xmp_body);
                         results.push(PromptRecord::with_details(
-                            path.to_path_buf(),
+                            origin.to_path_buf(),
                             prompt.clone(),
                             generator,
                             "XMP",
@@ -109,15 +91,7 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
                         ));
                     }
                 } else if body.starts_with(EXIF_HEADER) {
-                    if let Some(prompt) = exif::extract_user_comment(&body) {
-                        results.push(PromptRecord::with_details(
-                            path.to_path_buf(),
-                            prompt.clone(),
-                            Generator::Unknown,
-                            "UserComment",
-                            a1111::extract_details(&prompt),
-                        ));
-                    }
+                    results.extend(super::exif_records(origin, &body, verbose));
                 }
             }
             _ => {} // skip all other segments
@@ -203,11 +177,7 @@ mod tests {
     fn extracts_com_comment() {
         let jpeg_bytes = make_jpeg_with_com("portrait of a woman, oil painting");
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.jpg");
-        std::fs::write(&path, &jpeg_bytes).unwrap();
-
-        let records = extract(&path, false);
+        let records = extract(&mut jpeg_bytes.as_slice(), Path::new("test.jpg"), false);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].generator, Generator::A1111);
         assert_eq!(records[0].prompt, "portrait of a woman, oil painting");

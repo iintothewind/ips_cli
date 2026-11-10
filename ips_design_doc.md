@@ -4,8 +4,8 @@
 
 - **Name:** `ips` (Image Prompt Search)
 - **Language:** Rust (2021 edition, MSRV 1.75+)
-- **Goal:** A high-performance, cross-platform CLI tool to search AI-generated image prompts embedded in local image metadata (PNG, JPEG, WebP).
-- **Scope:** Local directory search only for v1. Remote URL list support is deferred to a future version to keep the binary small and dependency tree lean.
+- **Goal:** A high-performance, cross-platform CLI tool to search AI-generated image prompts embedded in image metadata (PNG, JPEG, WebP), from local files or http(s) URLs.
+- **Scope:** Local directory search plus remote http(s) images (`--url`, `--url-list`) through blocking `ureq` with rustls; no async runtime.
 
 ---
 
@@ -44,7 +44,7 @@ All stages are parallelized via work-stealing thread pool.
 ### Crates explicitly NOT used
 
 - `image` / `image-rs` — Decodes pixels; far too heavy for metadata-only reads.
-- `reqwest` / `tokio` — Async HTTP adds ~3MB to binary. Deferred to v2.
+- `reqwest` / `tokio` — Async HTTP adds ~3MB to binary. Remote input uses blocking `ureq` instead.
 - `exif` — Standard EXIF tags (e.g. `UserComment`) do not contain AI prompts in most generators. We parse raw segments instead.
 
 ---
@@ -104,16 +104,16 @@ for each chunk:
 
 | Chunk | Layout | Notes |
 |---|---|---|
-| `tEXt` | `keyword\0value` | Latin-1 / UTF-8 lossy |
-| `iTXt` | `keyword\0compression_flag(1) compression_method(1) language\0 translated_keyword\0 text` | **Only uncompressed** (`compression_flag == 0`) is supported. Compressed `iTXt` and `zTXt` chunks are not inflated — value will be garbage and JSON parse will fail → A1111 fallback if text looks like parameters. |
+| `tEXt` | `keyword\0value` | Latin-1 by spec (Pillow writes it so); valid UTF-8 is read as UTF-8 |
+| `iTXt` | `keyword\0compression_flag(1) compression_method(1) language\0 translated_keyword\0 text` | UTF-8; zlib-compressed (`compression_flag == 1`) and plain both supported. `zTXt` is not read. |
 
 #### Keyword routing
 
 | Keyword | Expected generator | Value format | Handler |
 |---|---|---|---|
 | `parameters` | A1111 / Forge | Plain A1111 parameters text | `a1111::extract_details(value)` → generator `A1111` |
-| `prompt` | ComfyUI | JSON workflow object `{ "node_id": { "class_type", "inputs" }, ... }` | See §4.5 |
-| `workflow` | ComfyUI | Secondary workflow JSON | **Ignored** — `prompt` keyword is the authoritative ComfyUI chunk |
+| `prompt` | ComfyUI | API prompt JSON `{ "node_id": { "class_type", "inputs" }, ... }`, or wrapped `{"prompt": …}` | See §4.5 |
+| `workflow` | ComfyUI | UI workflow JSON (`nodes` + `links`), or wrapped `{"workflow": …}` | Converted to API form, then §4.5. Muted (mode 2) and bypassed (mode 4) nodes keep their links but contribute no values. |
 | `Comment` | NovelAI | JSON with `"prompt"` field | See §4.6 |
 | `Description` | NovelAI (alt) | Plain text | `a1111::extract_details(value)` → generator `NovelAI` |
 | *(other)* | — | — | Silently skipped |
@@ -124,7 +124,7 @@ for each chunk:
 |---|---|
 | Truncated chunk (EOF mid-read) | Log if `--verbose`; return records collected so far |
 | Chunk missing null separator | `parse_text_chunk` returns `None`; chunk skipped |
-| `iTXt` with compression_flag = 1 | Uncompressed parser reads garbage; JSON fails → A1111 fallback on `prompt` keyword |
+| `prompt` / `workflow` JSON cut off before its end | Recovered up to the last complete value (`json_repair`), then §4.5 |
 | Both `parameters` AND `prompt` chunks present | **Two separate `PromptRecord`s** emitted (common for ComfyUI exports that also embed A1111-style parameters). Search may match both. |
 | Valid JSON `prompt` but no text-encode nodes | Record still created if model, loras, or sampler-traced prompts exist (`has_extractable_content`) |
 | `Comment` JSON valid but no `"prompt"` key | **No record** — silently skipped |
@@ -149,11 +149,11 @@ loop markers:
 
 | Segment | Generator (heuristic) | Handler |
 |---|---|---|
-| COM (`0xFFFE`) | A1111 | Full body → `a1111::extract_details` |
+| COM (`0xFFFE`) | A1111 | JSON object → ComfyUI (§4.5); else full body → `a1111::extract_details` |
 | APP1 XMP | InvokeAI if `invokeai:` in XML; else Unknown | `extract_xmp_description` → `a1111::extract_details` |
-| APP1 EXIF | Unknown | `exif::extract_user_comment` → `a1111::extract_details` |
+| APP1 EXIF | Unknown | `exif::extract_user_comment` → JSON object → ComfyUI (§4.5); else `a1111::extract_details` |
 
-**Note:** Standard EXIF tags other than `UserComment` are not scanned. AI prompts in JPEG are almost always in COM or XMP, not in camera EXIF fields.
+**Note:** Of the other EXIF tags, only IFD0 ASCII tags holding ComfyUI's `prompt:{…}` / `workflow:{…}` are read (§4.4). JPEG save nodes such as ComfyUI-JPG-Metadata store `json.dumps({"prompt": …, "workflow": …})` in UserComment; a graph larger than the 64 KB segment limit arrives cut off and is recovered up to the cut.
 
 #### JPEG-specific fault scenarios
 
@@ -169,28 +169,30 @@ loop markers:
 
 ---
 
-### 4.4 EXIF UserComment (JPEG APP1 / WebP EXIF chunk)
+### 4.4 EXIF (JPEG APP1 / WebP EXIF chunk)
 
-Implemented in `exif.rs` as a minimal TIFF IFD walker — no external EXIF library.
+Implemented in `exif.rs` as a minimal TIFF IFD walker — no external EXIF library. One EXIF block yields up to three records, in this order:
 
 ```
 Exif\0\0 prefix (optional) → TIFF header (II/MM + magic 42)
-→ walk IFD0 → find ExifIFD (tag 0x8769) → find UserComment (tag 0x9286)
-→ decode charset prefix + payload
+→ UserComment (tag 0x9286) in IFD0, or in the ExifIFD (tag 0x8769) → decode charset prefix + payload
+→ IFD0 ASCII tags of the form `prompt:{json}` / `workflow:{json}` → §4.5, keys `prompt` / `workflow`
 ```
+
+ComfyUI's WebP and AVIF savers (`comfy_api/latest/_ui.py`, `_create_webp_metadata`) write `prompt:` into Model (0x0110) and each `extra_pnginfo` entry into Make (0x010F), then 0x010E and down — `workflow:` first. Other keys and plain camera values (no `key:` prefix) are ignored. These values follow the PNG `prompt` / `workflow` rules: JSON that is not recoverable is kept as plain text, generator `Unknown`.
 
 | Charset tag | Decoding |
 |---|---|
-| `ASCII\0\0\0` | Raw bytes as lossy UTF-8 |
-| `UNICODE\0` | UTF-16 BE or LE (BOM-aware: `FE FF` / `FF FE`) |
-| Other / missing | Raw bytes as lossy UTF-8 |
+| `ASCII\0\0\0`, `JIS\0\0\0\0\0`, 8 zero bytes | Rest as lossy UTF-8 |
+| `UNICODE\0` | UTF-16. Byte order: BOM if present; else guessed from where the zero bytes of ASCII characters fall (piexif and most ComfyUI savers write big-endian even in little-endian TIFF); else the TIFF byte order |
+| No charset tag (Pillow writes a plain string) | Whole value as lossy UTF-8 |
 
 **Safety limits:**
 - IFD recursion depth capped at **4**
 - Every read checks `offset + length <= buffer.len()`
 - Oversized `count` field (declared length > available bytes) → decode what fits, no panic
 
-Extracted text is passed through `a1111::extract_details` because UserComment often contains full A1111-style parameter blocks.
+UserComment text that is a JSON object goes through §4.5 (ComfyUI); other text through `a1111::extract_details`, because UserComment often contains full A1111-style parameter blocks.
 
 ---
 
@@ -211,7 +213,7 @@ The PNG `prompt` keyword holds a JSON object: flat map of node IDs to node objec
 }
 ```
 
-**Expected top-level shape:** object whose values are nodes with `class_type` + `inputs`. Wrapped forms like `{"prompt": {...nodes...}}` are **not** unwrapped — they fail JSON routing and fall back to A1111 text parse.
+**Accepted top-level shapes:** an object whose values are nodes with `class_type` + `inputs`; `{"prompt": <API or UI>}`; `{"workflow": <UI>}`; a UI workflow (`nodes` + `links`). Anything else yields no record. Truncated JSON is first recovered up to its last complete value, and Python's `NaN` / `Infinity` / `-Infinity` (which `json.dumps` writes for non-finite floats) are read as `null`.
 
 #### Extraction strategy (`comfyui::extract_workflow`)
 
@@ -219,31 +221,31 @@ Two parallel extractions merge into one `(prompt, PromptDetails)`:
 
 **A. Searchable prompt text** (for matching):
 1. Scan all nodes; collect non-empty strings from text-encode nodes (`CLIPTextEncode`, `CLIPTextEncodeSDXL`, `CLIPTextEncodeFlux`, `TextEncodeQwenImageEdit*`, any `class_type` containing `Prompt` or `TextEncode`).
-2. Fields checked per node: `text_g`, `text_l`, `text`, `prompt` (SDXL uses `_g` / `_l`), plus negative fields `neg`, `negative_prompt`.
+2. Fields checked per node: `text_g`, `text_l` (SDXL), `clip_l`, `t5xxl` (Flux), `text`, `prompt`, plus negative fields `neg`, `negative_prompt`.
 3. Deduplicate identical strings; join with `" | "`.
 4. **Fallback:** if step 1–3 yield nothing, join sampler-traced `positive_prompt` and `negative_prompt` with `" | "`.
 
 **B. Structured details** (`PromptDetails`):
 | Field | Source |
 |---|---|
-| `model` | `CheckpointLoader*` / `UNETLoader` / `UnetLoaderGGUF` nodes → `inputs.ckpt_name` or `inputs.unet_name` |
+| `model` | `CheckpointLoader*` / `UNETLoader` / `UnetLoaderGGUF` nodes → `inputs.ckpt_name` or `inputs.unet_name`; otherwise any node carrying one of those fields (custom loaders) |
 | `loras` | Any node whose `class_type` contains `"lora"` (case-insensitive). Standard `LoraLoader`: `lora_name` + weights. rgthree `Power Lora Loader`: object-valued inputs with `"lora"` key; skip if `"on": false`. |
-| `positive_prompt` / `negative_prompt` | First `KSampler*` or `CFGGuider` node → follow `inputs.positive` / `inputs.negative` node refs (id **and output slot**) through conditioning graph |
+| `positive_prompt` / `negative_prompt` | First `KSampler*` / `SamplerCustom*` or guider (`CFGGuider`, `BasicGuider`, `DualCFGGuider`) that resolves → follow the positive input (`positive`, or a guider's `conditioning` / `cond1`) and `negative` node refs (id **and output slot**) through the conditioning graph |
 
 **Conditioning graph walk** (`resolve_conditioning_text`):
 - Node refs are `["node_id", slot_index]` arrays; the output slot travels with the reference (`CondRef { id, index }`).
 - Slot ≥ 1 is the negative stream: text comes only from `neg` / `negative_prompt` / `negative`, never from the shared positive field. A node that encodes both prompts in one pass (`TextEncodeQwenImage21`) yields its own negative text — nothing when `negative_prompt` is empty.
-- Slot 0 encodes the node's main prompt whichever sampler input it feeds: standard fields `text_g` / `text_l` / `text` / `prompt` first, then a role-named fallback (`positive`, or `neg` / `negative_prompt` / `negative` for a negative ref).
+- Slot 0 encodes the node's main prompt whichever sampler input it feeds: standard fields `text_g` / `text_l` / `clip_l` / `t5xxl` / `text` / `prompt` first, then a role-named fallback (`positive`, or `neg` / `negative_prompt` / `negative` for a negative ref).
 - If target is text-encode node → extract the fields above.
 - If target is `ZeroOut` → return `None` (empty negative conditioning).
-- Else follow role-specific input fields: positive → `positive`, `conditioning`, `conditioning1`, `conditioning2`, `cond`; negative → `negative`, `neg`, `conditioning`, `conditioning1`, `conditioning2`, `cond`. Role-named inputs reset the role for the next hop; neutral chain fields keep it.
+- Else follow role-specific input fields: positive → `positive`, `conditioning`, `conditioning_1`, `conditioning_2` (ConditioningCombine), `conditioning_to`, `conditioning_from` (ConditioningAverage/Concat), `conditioning1`, `conditioning2`, `cond`; negative → `negative`, `neg`, then the same chain fields. Role-named inputs reset the role for the next hop; neutral chain fields keep it.
 - **Cycle guard:** `HashSet<(String, u64)>` of visited node ID + slot pairs.
 
 #### ComfyUI fault scenarios
 
 | Scenario | Behavior |
 |---|---|
-| JSON parse fails entirely | **A1111 fallback** on raw string; generator `Unknown` |
+| JSON parse fails (not recoverable as truncated) | **A1111 fallback** on raw string; generator `Unknown` |
 | JSON valid but root is not an object | Empty `PromptDetails`; no record unless fallback text non-empty |
 | Node missing `class_type` or `inputs` | Skip node |
 | Text-encode nodes empty but model/loras present | Record created (`has_extractable_content`) |
@@ -354,15 +356,23 @@ Records are sorted by `(path, metadata_key)` for deterministic output.
 
 ### 4.9 Known Limitations (Not Yet Supported)
 
+Deliberately out of scope for now; each is a candidate for later work.
+
 | Limitation | Impact | Workaround |
 |---|---|---|
-| `iTXt` / `zTXt` compressed PNG text | Garbled value; JSON fails | A1111 fallback if text resembles parameters |
-| PNG metadata after `IDAT` | Never read | Rare; re-save PNG with metadata before image data |
-| ComfyUI JSON wrapped in outer object | Treated as invalid JSON → A1111 fallback | — |
-| Partial JSON repair | Not implemented | Full string preserved for search via fallback |
+| ComfyUI UI subgraphs | Nodes inside `definitions.subgraphs` are not expanded, so the `workflow` record can miss prompts and models held there; the `prompt` record is unaffected | Search the `prompt` record |
+| AVIF | Extension not supported, so ComfyUI AVIF output (same `prompt:` / `workflow:` EXIF tags as WebP) is never read | Save as PNG or WebP |
+| TIFF / GIF / BMP | Skipped (unsupported extension) | — |
+| `zTXt` PNG chunks | Not read | — |
+| PNG metadata after `IDAT` | Never read (parsing stops at image data so remote PNGs download only their header) | Re-save with metadata before image data |
+| WebP EXIF / XMP chunk cut off by end of file | The whole chunk is dropped; unlike JPEG UserComment JSON, no partial recovery | — |
+| JPEG Extended XMP (`http://ns.adobe.com/xmp/extension/` APP1 segments) | Skipped | — |
 | XMP formats without `<dc:description><rdf:Alt><rdf:li>` | `None` returned | — |
 | Multiple XMP `<rdf:li>` entries | Only first extracted | — |
-| AVIF / TIFF / GIF / BMP | Skipped (unsupported extension) | — |
+| NovelAI `Comment` JSON | Parsed strictly: truncated JSON or `NaN` falls back to plain text instead of the lenient ComfyUI parser | — |
+| A1111-style text in EXIF UserComment | Generator reported as `unknown`, not `a1111`, even when the text has A1111 parameters | Model / prompts are still parsed |
+| `DualCFGGuider` | Positive prompt taken from `cond1` only; `cond2` is ignored | — |
+| UI workflow node with an `id` that is neither number nor string | Conversion of the whole `workflow` aborts (no record from it) | — |
 
 ---
 
@@ -370,18 +380,22 @@ Records are sorted by `(path, metadata_key)` for deterministic output.
 
 ```
 PNG keyword "parameters"  ──→ a1111::extract_details          [A1111]
-PNG keyword "prompt"      ──→ serde_json OK  → comfyui::extract_workflow  [ComfyUI]
-                         └→ serde_json ERR → a1111::extract_details      [Unknown]
+PNG keyword "prompt" / "workflow" ──→ lenient JSON OK  → comfyui::extract_workflow  [ComfyUI]
+                                 └→ not JSON        → a1111::extract_details      [Unknown]
 PNG keyword "Comment"   ──→ serde_json OK  → json["prompt"] → a1111       [NovelAI]
                          └→ serde_json ERR → a1111::extract_details      [Unknown]
 PNG keyword "Description" ─→ a1111::extract_details          [NovelAI]
 
-JPEG COM                ──→ a1111::extract_details          [A1111]
+JPEG COM                ──→ JSON object → comfyui  [ComfyUI]; else a1111  [A1111]
 JPEG APP1 XMP           ──→ extract_xmp_description → a1111 [InvokeAI/Unknown]
-JPEG APP1 EXIF          ──→ exif::extract_user_comment → a1111 [Unknown]
+JPEG APP1 EXIF          ──→ UserComment: JSON object → comfyui [ComfyUI]; else a1111 [Unknown]
+                         └→ IFD0 "prompt:" / "workflow:" tags → (same as PNG "prompt" / "workflow")
 
 WebP XMP chunk          ──→ (same as JPEG XMP)
 WebP EXIF chunk         ──→ (same as JPEG EXIF)
+
+"Lenient JSON": truncated documents are recovered up to the last complete value, and
+Python's NaN / Infinity / -Infinity tokens are read as null.
 ```
 
 ---
@@ -526,13 +540,17 @@ path,generator,prompt,score
 ## 7. CLI Interface
 
 ```
-ips [OPTIONS] --query <QUERY> [PATH]
+ips [OPTIONS] [PATH]
+ips [OPTIONS] --url <URL>
+ips [OPTIONS] --url-list <FILE>
 
 Arguments:
-  [PATH]    Directory to search [default: .]
+  [PATH]    Directory or image file to search [default: .]
 
 Options:
-  -q, --query <QUERY>       Search query (required)
+  -q, --query <QUERY>       Search query; omit to output every record
+      --url <URL>           Read one remote image from an http(s) URL instead of PATH
+      --url-list <FILE>     Read remote images from FILE, one URL per line (`-` = stdin)
   -f, --format <FORMAT>     Output format: console, json, csv [default: console]
       --fuzzy               Enable fuzzy matching (default is exact substring)
       --regex               Enable regex matching
@@ -541,9 +559,9 @@ Options:
   -p, --path-only           Print only file paths (no prompt text)
       --depth <N>           Maximum directory recursion depth [default: unlimited]
       --no-recursive        Disable recursive directory traversal
-  -j, --threads <N>         Number of threads [default: num_cpus]
+  -j, --threads <N>         Number of threads, also concurrent downloads [default: num_cpus]
   -v, --verbose             Print skipped files and errors to stderr
-      --no-color            Disable ANSI color output (also respects NO_COLOR env)
+      --no-color            Disable ANSI color output (automatic with NO_COLOR or non-terminal stdout)
   -h, --help                Print help
   -V, --version             Print version
 ```
@@ -590,9 +608,10 @@ ips -q "anime" -v ./mixed_files
 | Symlink loop | `walkdir` detects and skips by default. |
 | Non-UTF-8 metadata | Lossy UTF-8 conversion (`String::from_utf8_lossy`). |
 | Empty directory / no matches | Exit with code 0, empty output. Print "No matches found." to stderr in console mode. |
-| Invalid query regex | Exit with code 1 and a clear error message. |
+| Invalid query regex, bad flag, missing `PATH`, URL passed as `PATH`, unreadable URL list | Exit with code 2 and a clear error message. |
+| URL fails (HTTP status, transport error, timeout, not an image, invalid list line) | Print `ips: <url>: <reason>` to stderr, continue with the remaining URLs, output results, exit with code 3. |
 
-General principle: **Never crash on bad input.** Log and skip individual files; only fatal errors (bad CLI args, invalid regex) cause a non-zero exit. Metadata extraction follows the layered fault-tolerance model in §4.0 — individual fields may be empty without losing the whole record.
+General principle: **Never crash on bad input.** Log and skip individual local files; input errors exit 2 and URL failures exit 3. Metadata extraction follows the layered fault-tolerance model in §4.0 — individual fields may be empty without losing the whole record.
 
 ---
 
@@ -607,13 +626,15 @@ ips/
 │   ├── lib.rs               # Library crate root (shared by main + tests)
 │   ├── discovery.rs         # Directory walking, extension filtering
 │   ├── extract/
-│   │   ├── mod.rs           # Public extract API: fn extract_prompt(path) -> Vec<PromptRecord>
+│   │   ├── mod.rs           # extract_prompt(path) / extract_from(format, reader); shared ComfyUI-JSON and text record helpers
 │   │   ├── a1111.rs         # A1111/NovelAI parameter text parsing (model, loras, prompts)
 │   │   ├── png.rs           # PNG tEXt/iTXt chunk parsing
 │   │   ├── jpeg.rs          # JPEG COM marker, XMP, EXIF routing
 │   │   ├── webp.rs          # WebP RIFF chunk parsing
 │   │   ├── exif.rs          # Minimal EXIF IFD walker (UserComment)
+│   │   ├── json_repair.rs   # Recovery of truncated JSON (cut-off EXIF/JPEG metadata)
 │   │   └── comfyui.rs       # ComfyUI workflow JSON extraction
+│   ├── remote.rs            # http(s) input: URL lists, streaming fetch
 │   ├── matcher.rs           # Exact, fuzzy, and regex matching
 │   ├── output/
 │   │   ├── mod.rs           # Output dispatcher
@@ -622,7 +643,8 @@ ips/
 │   │   └── csv.rs           # CSV serialization
 │   └── types.rs             # PromptRecord, PromptDetails, MatchResult, Config
 └── tests/
-    ├── examples/            # Test images from each generator (optional fixtures)
+    ├── fixtures/metadata/   # Metadata of real images (SFW samples) + synthetic cases, one JSON per image
+    ├── metadata_fixtures.rs # Rebuilds each fixture into an image and checks the extracted records
     └── integration_tests.rs
 ```
 
@@ -728,7 +750,9 @@ Key performance techniques:
 
 ## 13. Future Work (v2)
 
-- `--url-list <file>`: Download images from a URL list and search metadata. Requires `reqwest` + `tokio`. Will be gated behind a cargo feature flag to keep the default binary lean.
+- Extraction gaps listed in §4.9 (ComfyUI subgraphs, AVIF, partial WebP chunk recovery, …).
+- JSON output: include `metadata_key`, so callers can tell the `prompt` and `workflow` records of one file apart.
+- Not planned: `--limit` / pagination. ips is stateless, so every page would rescan (and for `--url-list`, re-download) all inputs. Large result sets are handled by exporting (`-f json > results.json`) and slicing with `jq` or similar tools.
 - `--watch` mode: Watch a directory for new images and search incrementally.
 - Index/cache: Build a local SQLite index of extracted prompts for instant repeat searches.
 - Additional formats: AVIF, TIFF, PSD metadata extraction.

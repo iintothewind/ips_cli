@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use crate::types::{LoraInfo, PromptDetails};
 
-/// Normalize ComfyUI JSON from API prompt, wrapped prompt, or UI workflow format.
+/// Normalize ComfyUI JSON from API prompt, wrapped prompt/workflow, or UI workflow format.
 pub fn normalize_workflow(json: &Value) -> Cow<'_, Value> {
     if let Some(api) = extract_api_nodes(json) {
         return Cow::Owned(Value::Object(api));
@@ -17,6 +17,11 @@ pub fn normalize_workflow(json: &Value) -> Cow<'_, Value> {
         if let Some(converted) = ui_workflow_to_api(inner) {
             return Cow::Owned(converted);
         }
+    }
+
+    // `{"workflow": {...}}`, as written by JPEG converters that keep only the UI graph.
+    if let Some(converted) = json.get("workflow").and_then(ui_workflow_to_api) {
+        return Cow::Owned(converted);
     }
 
     if let Some(converted) = ui_workflow_to_api(json) {
@@ -52,6 +57,11 @@ fn ui_workflow_to_api(json: &Value) -> Option<Value> {
             .get("type")
             .or_else(|| node.get("class_type"))
             .and_then(|v| v.as_str())?;
+        // Muted (mode 2) and bypassed (mode 4) nodes take no part in the run. Keep only their
+        // links, so conditioning chains still resolve through a bypassed node, but none of
+        // their own values: a bypassed LoRA loader applies no LoRA.
+        let inactive = matches!(node.get("mode").and_then(|v| v.as_u64()), Some(2 | 4));
+        let class_type = if inactive { INACTIVE_NODE } else { class_type };
 
         let mut inputs = Map::new();
 
@@ -74,7 +84,9 @@ fn ui_workflow_to_api(json: &Value) -> Option<Value> {
             }
         }
 
-        apply_widgets_values(class_type, node.get("widgets_values"), &mut inputs);
+        if !inactive {
+            apply_widgets_values(class_type, node.get("widgets_values"), &mut inputs);
+        }
 
         let mut node_obj = Map::new();
         node_obj.insert("class_type".to_string(), Value::String(class_type.to_string()));
@@ -88,6 +100,9 @@ fn ui_workflow_to_api(json: &Value) -> Option<Value> {
         Some(Value::Object(api))
     }
 }
+
+/// Stand-in class for muted and bypassed UI nodes.
+const INACTIVE_NODE: &str = "(inactive)";
 
 fn node_id_string(id: &Value) -> Option<String> {
     match id {
@@ -209,8 +224,8 @@ pub fn extract_from_workflow(json: &Value) -> Vec<String> {
             None => continue,
         };
 
-        // CLIPTextEncodeSDXL uses text_g and text_l
-        for field in &["text_g", "text_l", "text", "prompt", "neg", "negative_prompt"] {
+        // CLIPTextEncodeSDXL uses text_g/text_l, CLIPTextEncodeFlux clip_l/t5xxl
+        for field in &["text_g", "text_l", "clip_l", "t5xxl", "text", "prompt", "neg", "negative_prompt"] {
             if let Some(text) = inputs.get(*field).and_then(|v| v.as_str()) {
                 let text = text.trim().to_string();
                 if !text.is_empty() && !prompts.contains(&text) {
@@ -264,7 +279,7 @@ pub fn extract_details_from_workflow(json: &Value) -> PromptDetails {
 
     for (_node_id, node) in nodes {
         let class_type = node.get("class_type").and_then(|v| v.as_str()).unwrap_or_default();
-        if !is_sampler_node(class_type) && class_type != "CFGGuider" && class_type != "BasicGuider" {
+        if !is_sampler_node(class_type) && !GUIDER_NODES.contains(&class_type) {
             continue;
         }
 
@@ -273,8 +288,11 @@ pub fn extract_details_from_workflow(json: &Value) -> PromptDetails {
         };
 
         if details.positive_prompt.is_none() {
-            details.positive_prompt = inputs
-                .get("positive")
+            // Guiders name their positive input differently: BasicGuider `conditioning`,
+            // DualCFGGuider `cond1`.
+            details.positive_prompt = ["positive", "conditioning", "cond1"]
+                .iter()
+                .find_map(|field| inputs.get(*field))
                 .and_then(ref_cond)
                 .and_then(|cond| resolve_conditioning_text(&normalized, &cond, PromptRole::Positive));
         }
@@ -485,7 +503,8 @@ fn resolve_conditioning_text_inner(
     None
 }
 
-const PROMPT_TEXT_FIELDS: &[&str] = &["text_g", "text_l", "text", "prompt"];
+const GUIDER_NODES: &[&str] = &["CFGGuider", "BasicGuider", "DualCFGGuider"];
+const PROMPT_TEXT_FIELDS: &[&str] = &["text_g", "text_l", "clip_l", "t5xxl", "text", "prompt"];
 const NEGATIVE_TEXT_FIELDS: &[&str] = &["neg", "negative_prompt", "negative"];
 
 fn input_fields_for(role: PromptRole) -> &'static [&'static str] {
@@ -493,6 +512,10 @@ fn input_fields_for(role: PromptRole) -> &'static [&'static str] {
         PromptRole::Positive => &[
             "positive",
             "conditioning",
+            "conditioning_1",
+            "conditioning_2",
+            "conditioning_to",
+            "conditioning_from",
             "conditioning1",
             "conditioning2",
             "cond",
@@ -501,6 +524,10 @@ fn input_fields_for(role: PromptRole) -> &'static [&'static str] {
             "negative",
             "neg",
             "conditioning",
+            "conditioning_1",
+            "conditioning_2",
+            "conditioning_to",
+            "conditioning_from",
             "conditioning1",
             "conditioning2",
             "cond",

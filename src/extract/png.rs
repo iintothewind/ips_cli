@@ -1,30 +1,18 @@
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 
 use crate::types::{Generator, PromptRecord};
-use super::{a1111, comfyui};
+use super::a1111;
 
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+pub(super) const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
-pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            if verbose {
-                eprintln!("ips: cannot read {}: {}", path.display(), e);
-            }
-            return vec![];
-        }
-    };
-
-    let mut reader = BufReader::new(file);
-
+pub fn extract<R: Read>(reader: &mut R, origin: &Path, verbose: bool) -> Vec<PromptRecord> {
     let mut sig = [0u8; 8];
     if reader.read_exact(&mut sig).is_err() || &sig != PNG_SIGNATURE {
         if verbose {
-            eprintln!("ips: {}: not a valid PNG", path.display());
+            eprintln!("ips: {}: not a valid PNG", origin.display());
         }
         return vec![];
     }
@@ -48,13 +36,15 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
             break;
         }
 
-        let mut chunk_data = vec![0u8; length];
-        if reader.read_exact(&mut chunk_data).is_err() {
-            if verbose {
-                eprintln!("ips: {}: truncated chunk", path.display());
+        let chunk_data = match super::read_exact_vec(reader, length) {
+            Ok(data) => data,
+            Err(_) => {
+                if verbose {
+                    eprintln!("ips: {}: truncated chunk", origin.display());
+                }
+                break;
             }
-            break;
-        }
+        };
 
         let mut crc_buf = [0u8; 4];
         if reader.read_exact(&mut crc_buf).is_err() {
@@ -64,12 +54,12 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
         match &chunk_type {
             b"tEXt" => {
                 if let Some((keyword, value)) = parse_text_chunk(&chunk_data) {
-                    process_keyword(path, &keyword, &value, &mut results);
+                    process_keyword(origin, &keyword, &value, verbose, &mut results);
                 }
             }
             b"iTXt" => {
                 if let Some((keyword, value)) = parse_itxt_chunk(&chunk_data) {
-                    process_keyword(path, &keyword, &value, &mut results);
+                    process_keyword(origin, &keyword, &value, verbose, &mut results);
                 }
             }
             _ => {}
@@ -81,9 +71,16 @@ pub fn extract(path: &Path, verbose: bool) -> Vec<PromptRecord> {
 
 fn parse_text_chunk(data: &[u8]) -> Option<(String, String)> {
     let null_pos = data.iter().position(|&b| b == 0)?;
-    let keyword = String::from_utf8_lossy(&data[..null_pos]).into_owned();
-    let value = String::from_utf8_lossy(&data[null_pos + 1..]).into_owned();
-    Some((keyword, value))
+    Some((latin1_or_utf8(&data[..null_pos]), latin1_or_utf8(&data[null_pos + 1..])))
+}
+
+/// tEXt is Latin-1 by specification (Pillow writes it that way); some tools store UTF-8
+/// instead, so valid UTF-8 is taken as such.
+fn latin1_or_utf8(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => bytes.iter().map(|&b| char::from(b)).collect(),
+    }
 }
 
 fn parse_itxt_chunk(data: &[u8]) -> Option<(String, String)> {
@@ -119,7 +116,13 @@ fn inflate_zlib(data: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<PromptRecord>) {
+fn process_keyword(
+    path: &Path,
+    keyword: &str,
+    value: &str,
+    verbose: bool,
+    results: &mut Vec<PromptRecord>,
+) {
     match keyword {
         "parameters" => {
             results.push(PromptRecord::with_details(
@@ -131,7 +134,7 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
             ));
         }
         "prompt" | "workflow" => {
-            push_comfyui_record(path, keyword, value, results);
+            results.extend(super::comfyui_keyword_record(path, keyword, value, verbose));
         }
         "Comment" => {
             match serde_json::from_str::<serde_json::Value>(value) {
@@ -174,34 +177,6 @@ fn process_keyword(path: &Path, keyword: &str, value: &str, results: &mut Vec<Pr
     }
 }
 
-fn push_comfyui_record(path: &Path, keyword: &str, value: &str, results: &mut Vec<PromptRecord>) {
-    match serde_json::from_str::<serde_json::Value>(value) {
-        Ok(json) => {
-            let (prompt, details) = comfyui::extract_workflow(&json);
-            if comfyui::has_extractable_content(&prompt, &details) {
-                results.push(PromptRecord::with_details(
-                    path.to_path_buf(),
-                    prompt,
-                    Generator::ComfyUI,
-                    keyword,
-                    details,
-                ));
-            }
-        }
-        Err(_) => {
-            if !value.trim().is_empty() {
-                results.push(PromptRecord::with_details(
-                    path.to_path_buf(),
-                    value.to_string(),
-                    Generator::Unknown,
-                    keyword,
-                    a1111::extract_details(value),
-                ));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,11 +208,7 @@ mod tests {
         chunk_data.extend_from_slice(text.as_bytes());
         let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &chunk_data)]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.png");
-        std::fs::write(&path, &png_bytes).unwrap();
-
-        let records = extract(&path, false);
+        let records = extract(&mut png_bytes.as_slice(), Path::new("test.png"), false);
         assert_eq!(
             records[0].details_or_default().model.as_deref(),
             Some("base.safetensors")
@@ -251,11 +222,7 @@ mod tests {
         data.extend_from_slice(workflow.as_bytes());
         let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &data)]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.png");
-        std::fs::write(&path, &png_bytes).unwrap();
-
-        let records = extract(&path, false);
+        let records = extract(&mut png_bytes.as_slice(), Path::new("test.png"), false);
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].generator, Generator::ComfyUI);
         assert_eq!(records[0].prompt, "workflow keyword prompt");
@@ -268,11 +235,7 @@ mod tests {
         data.extend_from_slice(text.as_bytes());
         let png_bytes = make_png_with_chunks(&[make_png_chunk(b"tEXt", &data)]);
 
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("test.png");
-        std::fs::write(&path, &png_bytes).unwrap();
-
-        let records = extract(&path, false);
+        let records = extract(&mut png_bytes.as_slice(), Path::new("test.png"), false);
         assert_eq!(records[0].generator, Generator::Unknown);
         assert_eq!(
             records[0].details_or_default().model.as_deref(),
